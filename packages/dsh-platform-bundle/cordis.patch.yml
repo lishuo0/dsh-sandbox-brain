@@ -1,0 +1,51 @@
+# API-only composition.
+#
+# Applied after dsh-base. Installs exactly one thing: an HTTP server.
+#
+# Deliberately absent, and why:
+#
+#   web-runtime      serves the frontend dist, opens a browser, injects the web prompt
+#   client-hmr       rebuild watcher for client bundles
+#   modules          browser plugin roster (window.__DSH_BOOT__)
+#   dsh.client-*     UI plugins
+#   connection       binds the Typert gateway to /api and runs browser token/cookie auth
+#   api-remotes      registers Typert Remote methods
+#   api-*            the Remote controllers themselves
+#
+# Our platform talks to /v1/* routes registered by our own plugin on the same
+# webserver, with our own authentication. Nothing here speaks Typert.
+#
+# `typert`, `typert-loader` and `typert-gateway` come from dsh-base. They load but
+# never dispatch: with no /api route mounted, nothing calls them.
+
+- insert:
+    # ── HTTP transport ──────────────────────────────────────────────────────
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        # The API service listens on every interface inside the pod. Override
+        # with DSH_HOST when a concrete interface is required.
+        host: !!js process.env.DSH_HOST ?? '0.0.0.0'
+        port: !!js Number(process.env.PORT ?? 8080)
+
+    # ── our REST surface ────────────────────────────────────────────────────
+    # Registers routes on ctx.webServer. Authentication lives here (mTLS or a
+    # service token), so DSH's browser auth is not involved at all.
+    #
+    - id: platform-api
+      name: '@brain/dsh-platform-api'
+      config:
+        credentialsFile: !!js process.env.DSH_PLATFORM_APPS
+        requireUser: true
+
+    # 消息级反馈（Like/Dislike）：事件写入会话日志，平台通过 /v1 路由代理。
+    - id: message-feedback
+      name: '@deepseek-ai/dsh-message-feedback'
+      config:
+        maxNoteBytes: 8192
+
+    # ── agent templates ─────────────────────────────────────────────────────
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: platform

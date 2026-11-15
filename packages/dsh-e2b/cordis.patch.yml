@@ -1,0 +1,28 @@
+# Loads the E2B sandbox runtime into a profile.
+#
+# Four rows: the registry plus the three providers that replace DSH's local
+# implementations. Row ids match the ones dsh-base inserts, so these replace
+# rather than add.
+#
+# Prerequisites in the profile patch:
+#   - `sandboxes.directory` must resolve a session to its user and project.
+#   - `web-runtime` / `client-hmr` are disabled (API-only profile).
+#
+# Local debugging: set `adapter: mock` in the profile patch. Sandboxes then run
+# as ordinary directories under ~/.dsh/sandboxes, with no E2B account and no VM.
+# Isolation is a path check in trusted code, so never use mock for security
+# testing.
+
+- insert:
+    # 沙箱注册表那一行不在这里声明 —— 补丁是整段替换 config，
+    # 同一行出现在两层会互相覆盖。它由 profile 补丁完整给出：
+    #   profiles/api/cordis.patch.yml  →  id: sandboxes
+
+    - id: fs
+      name: '@brain/dsh-e2b/fs'
+
+    - id: subprocess
+      name: '@brain/dsh-e2b/subprocess'
+
+    - id: sandbox
+      name: '@brain/dsh-e2b/sandbox'

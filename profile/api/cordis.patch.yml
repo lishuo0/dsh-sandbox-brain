@@ -1,0 +1,266 @@
+# 这一份部署的插件接线。密钥来自启动时注入的环境变量，不写在这里。
+
+- insert:
+    # 客户端连接要用的浏览器会话密钥。模型密钥仍走 credentials-session，不写进这份存储。
+    - id: browser-auth-store
+      name: '@brain/dsh-browser-auth-store'
+
+    - id: connection
+      name: '@deepseek-ai/dsh-client-connection'
+      config:
+        trustedHosts:
+          - localhost
+          - 127.0.0.1
+
+    - id: file-upload
+      name: '@deepseek-ai/dsh-client-file-upload'
+
+    - id: api-remotes
+      name: '@deepseek-ai/dsh-api-remotes'
+
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+    - id: session-controller
+      name: '@deepseek-ai/dsh-api-session-controller'
+      config:
+        nativeOpen: false
+
+    - id: workspace-files
+      name: '@deepseek-ai/dsh-api-workspace-files'
+
+    - id: workspace-controller
+      name: '@deepseek-ai/dsh-api-workspace-controller'
+      config:
+        documentsDirectory: !!js process.env.DSH_HOME ?? '/tmp'
+
+    - id: database
+      name: '@brain/dsh-database'
+      config:
+        url: !!js process.env.DSH_DATABASE_URL
+        maxConnections: 10
+
+    - id: session-persistence
+      name: '@brain/dsh-session-pg'
+      config:
+        leaseMs: 30000
+
+    - id: session-directory
+      name: '@brain/dsh-session-directory'
+      config:
+        cacheTtlMs: 30000
+
+    - id: sandboxes
+      name: '@brain/dsh-e2b/sandboxes'
+      config:
+        adapter: !!js process.env.SANDBOX_ADAPTER || 'e2b'
+        mock:
+          objectDir: !!js process.env.DSH_LOCAL_STORE || ''
+        scope: workspace
+        sandboxTimeoutMs: 3600000
+        idleMs: 3600000
+        sweepIntervalMs: 60000
+        reclaimOrphans: false
+        volumeMountPath: "/desk/{workspaceId}"
+        volumeNameTemplate: "desk-{workspaceId}"
+        privateSkillDir: "/skillbox/own"
+        publicSkillDir: "/skillbox/common"
+        ossMounts:
+          - bucketName: !!js process.env.OSS_BUCKET ?? ''
+            endpoint: !!js process.env.OSS_ENDPOINT ?? ''
+            bucketPath: "desks/{workspaceId}"
+            mountDir: "/desk/{workspaceId}"
+            readOnly: false
+        storeKind: postgres
+        directory: !!js ctx.get('sessionDirectory')
+        e2b:
+          apiKey: !!js process.env.E2B_API_KEY ?? ''
+          apiUrl: !!js process.env.E2B_API_URL ?? ''
+          domain: !!js process.env.E2B_DOMAIN ?? ''
+          template: !!js process.env.E2B_TEMPLATE ?? ''
+          onTimeout: kill
+          connectTimeoutMs: 3600000
+          allowInternetAccess: true
+          allowPublicTraffic: false
+          roleArn: !!js process.env.E2B_ROLE_ARN ?? ''
+          requestTimeoutMs: 15000
+          commandTimeoutMs: 3600000
+
+    - id: credentials-session
+      name: '@brain/dsh-credentials-session'
+      config:
+        ref: DSH_MODEL_KEY
+
+    - id: user-skills
+      name: '@brain/dsh-user-skills'
+      config:
+        privateRoot: /skillbox/own
+        publicRoot: /skillbox/common
+
+    - id: user-mcp
+      name: '@brain/dsh-user-mcp'
+      config:
+        credentialsKeyEnv: DSH_CREDENTIALS_KEY
+        defaultToolCallTimeoutMs: 60000
+
+    - id: web-limiter
+      name: '@brain/dsh-web-limiter'
+      config:
+        maxGlobal: 4
+        maxPerUser: 2
+        maxQueue: 32
+        queueMs: 10000
+
+    - id: workspace-policy
+      name: '@brain/dsh-workspace-policy'
+
+    - id: schedule-tasks
+      name: '@brain/dsh-schedule-tasks'
+
+    - id: tool-abort-policy
+      name: '@brain/dsh-tool-abort-policy'
+      config:
+        abortGraceMs: 0
+
+    - id: attachment-oss
+      name: '@brain/dsh-attachment-oss'
+      config:
+        dshHome: !!js process.env.DSH_HOME ?? '/data'
+        maxImageBytes: 20971520
+        maxImagesPerMessage: 20
+
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: !!js process.env.DSH_HOST
+    port: !!js Number(process.env.PORT)
+
+- id: platform-api
+  name: '@brain/dsh-platform-api'
+  config:
+    requireUser: true
+    pageSize: 200
+    heartbeatMs: 15000
+    apps:
+      - appId: !!js process.env.PLATFORM_APP_ID ?? 'platform'
+        appKey: !!js process.env.PLATFORM_APP_KEY
+        name: platform
+
+- id: permission
+  config:
+    defaultPreset: workspace-write
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: never
+      workspace-write:
+        sandbox: workspace-write
+        approval: never
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+
+- id: approval
+  config:
+    policy: never
+
+- id: typert-gateway
+  config:
+    websocketCompression: none
+
+- id: credentials
+  disabled: true
+
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      user:
+        displayName: User model
+        apiKeyEnv: DSH_MODEL_KEY
+        api: openai-completions
+        baseURL: http://dsh-model.invalid
+        headers: {}
+        models:
+          - id: unconfigured
+            name: Unconfigured
+            contextWindow: 128000
+            maxTokens: 8192
+            input:
+              - text
+
+- id: agent-default-model
+  config:
+    provider: user
+    model: unconfigured
+
+- id: fs-sandbox
+  disabled: true
+
+- id: session-persistence-jsonl
+  disabled: true
+
+- id: ptc-runtime
+  disabled: true
+
+- id: workflow-ptc
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    maxDepth: 1
+
+- id: tool-bash
+  config:
+    enableRunInBackground: true
+    promoteOnTimeout: true
+
+- id: tool-goal
+  config:
+    blockedAfterConsecutiveRounds: 3
+
+- id: attachment-local
+  disabled: true
+
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- id: session-log-deepseek
+  disabled: true
+
+- id: tool-working-directory
+  disabled: true
+
+- id: goal-round-driver
+  disabled: true
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: web-fetch-http
+  config:
+    maxResponseBytes: 1000000
+    maxBodyChars: 50000
+    timeoutMs: 15000
+    maxRedirects: 3
+
+- id: tool-web
+  config:
+    search: false
+    fetch: true
+    fetchTimeoutMs: 20000
+    fetchMaxOutputChars: 60000

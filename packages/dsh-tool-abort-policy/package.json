@@ -1,0 +1,29 @@
+{
+  "name": "@brain/dsh-tool-abort-policy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hard tool-call abort: settle a cancelled or expired tool call even when the tool ignores its signal.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

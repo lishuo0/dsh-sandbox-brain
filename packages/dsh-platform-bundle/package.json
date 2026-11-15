@@ -1,0 +1,16 @@
+{
+  "name": "@brain/dsh-platform-bundle",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "API-only composition for DSH: HTTP transport plus the API controllers, no browser surface.",
+  "dsh": {
+    "bundle": {
+      "patch": ["./cordis.patch.yml", "./presets/platform.patch.yml"]
+    }
+  },
+  "files": [
+    "cordis.patch.yml",
+    "presets"
+  ]
+}

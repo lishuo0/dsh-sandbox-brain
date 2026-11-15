@@ -1,0 +1,32 @@
+{
+  "name": "@brain/dsh-database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One PostgreSQL pool per brain process; every persistence consumer injects it.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.8.0"
+  }
+}

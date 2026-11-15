@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "src",
+    "outDir": "lib",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

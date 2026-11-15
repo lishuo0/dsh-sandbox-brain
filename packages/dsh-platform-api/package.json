@@ -1,0 +1,36 @@
+{
+  "name": "@brain/dsh-platform-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "REST surface for the agent platform: session create/prompt/cancel/events over plain HTTP, authenticated by appId/appKey pairs.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@brain/dsh-credentials-session": "*",
+    "@brain/dsh-session-pg": "*",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-jobs": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-session-persistence": "*",
+    "@deepseek-ai/dsh-host-webserver": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

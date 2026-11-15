@@ -1,0 +1,67 @@
+# The `platform` agent template: what the model can actually do.
+#
+# Sandbox status of the tools this preset exposes (see @brain/dsh-e2b):
+#
+#   bash            ✅ sandbox   ctx.shell → ctx.subprocess → E2B
+#   read/write/edit ✅ sandbox   ctx.fs → E2B
+#   job_*           ⚠️ partial   processes run in the sandbox; the job registry
+#                                is brain-local and is lost on restart
+#   web_fetch       ❌ brain     anonymous public HTTP, bounded and limited by
+#                                @brain/dsh-web-limiter (enabled)
+#   web_search      ❌ disabled  one search is a full model call sharing the key
+#   goal/todo/plan  ✅ session   state events in the session log; tools are
+#                                host-scope and enabled by the profile
+#
+# Host-scope tools from dsh-base are NOT filtered by this preset; the profile
+# must disable every host-only tool row explicitly.
+#
+# Deliberately absent, for the first phase:
+#
+#   (subagents are ENABLED at host scope by the profile: a child session
+#    resolves to the parent's workspace and shares its sandbox; a brain
+#    restart still drops the waiting parent, accepted for this phase.)
+#   tool-workflow / workflow-ptc
+#       Orchestration state lives in the process.
+#   terminal-*
+#       The E2B process provider does not implement PTY yet.
+#   fs-search
+#       Spawns the brain-hosted @vscode/ripgrep binary; that path does not
+#       exist inside the sandbox. Use bash + grep/rg in the sandbox instead.
+#   skill
+#       The shipped skill provider scans the brain's filesystem, not the
+#       sandbox; per-user skills are a later phase.
+#   read_image / attachments
+#       The image tool needs the brain-side attachment store, whose files are
+#       shared by every tenant; the profile disables `attachment-local` so the
+#       tool never registers. Image input returns when uploads get per-user
+#       storage and ownership checks.
+#
+# Re-introduce each one only after its execution world and cross-replica
+# behaviour are settled.
+
+- insert:
+    - id: preset-platform
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: platform
+        name: 标准模式
+        description: 默认的通用 Agent 组合
+        order: 1
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+
+          - id: instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+
+          - id: bash
+            name: '@deepseek-ai/dsh-tool-bash'
+
+          - id: fs
+            name: '@deepseek-ai/dsh-tool-fs'
+
+          - id: jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          - id: time
+            name: '@deepseek-ai/dsh-time-context'

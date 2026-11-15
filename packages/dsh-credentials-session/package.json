@@ -1,0 +1,29 @@
+{
+  "name": "@brain/dsh-credentials-session",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-session model key provider; the platform supplies the key when it creates or resumes the session.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-credentials": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

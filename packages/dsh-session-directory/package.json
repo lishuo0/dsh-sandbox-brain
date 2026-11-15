@@ -1,0 +1,29 @@
+{
+  "name": "@brain/dsh-session-directory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Resolves a session to its user and project. Called on every tool call, so it caches.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@brain/dsh-database": "*",
+    "@deepseek-ai/cordis": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

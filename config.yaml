@@ -1,0 +1,37 @@
+# 脑唯一配置。数据库、阿里云沙箱、OSS 与平台写同一套环境，密钥各自保管。
+# sandbox.apiKey 留空时，不连阿里云。storage.dir 与平台的对象目录是同一份。
+
+database:
+  url: postgres://dsh:dsh@localhost:5432/dsh
+
+aliyun:
+  sandbox:
+    apiKey: ""
+    apiUrl: https://api.cn-beijing.sandbox.aliyuncs.com
+    domain: cn-beijing.sandbox.aliyuncs.com
+    template: ""
+    roleArn: ""
+  oss:
+    region: cn-beijing
+    endpoint: ""
+    bucket: ""
+    accessKeyId: ""
+    accessKeySecret: ""
+
+http:
+  host: 0.0.0.0
+  port: 8080
+
+# 与平台 brain.appId / brain.appKey、credentialsKey 一致。
+platform:
+  appId: platform
+  appKey: ""
+
+credentialsKey: ""
+
+# 引入的内核版本。主客户端 UI 也锁这一版。
+dshVersion: 0.2.2-rc.3
+
+# 本地沙箱读这个目录。与平台 storage.dir 指同一处。
+storage:
+  dir: ../dsh-sandbox-platform/var/objects

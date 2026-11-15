@@ -1,0 +1,31 @@
+{
+  "name": "dsh-profile-api",
+  "private": true,
+  "type": "module",
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@brain/dsh-platform-bundle",
+        "@brain/dsh-e2b"
+      ]
+    }
+  },
+  "dependencies": {
+    "@brain/dsh-platform-bundle": "file:../../packages/dsh-platform-bundle",
+    "@brain/dsh-platform-api": "file:../../packages/dsh-platform-api",
+    "@brain/dsh-e2b": "file:../../packages/dsh-e2b",
+    "@brain/dsh-database": "file:../../packages/dsh-database",
+    "@brain/dsh-session-pg": "file:../../packages/dsh-session-pg",
+    "@brain/dsh-session-directory": "file:../../packages/dsh-session-directory",
+    "@brain/dsh-web-limiter": "file:../../packages/dsh-web-limiter",
+    "@brain/dsh-credentials-session": "file:../../packages/dsh-credentials-session",
+    "@brain/dsh-user-skills": "file:../../packages/dsh-user-skills",
+    "@brain/dsh-user-mcp": "file:../../packages/dsh-user-mcp",
+    "@brain/dsh-tool-abort-policy": "file:../../packages/dsh-tool-abort-policy",
+    "@brain/dsh-attachment-oss": "file:../../packages/dsh-attachment-oss",
+    "@brain/dsh-schedule-tasks": "file:../../packages/dsh-schedule-tasks",
+    "@brain/dsh-workspace-policy": "file:../../packages/dsh-workspace-policy",
+    "@brain/dsh-browser-auth-store": "file:../../packages/dsh-browser-auth-store"
+  }
+}

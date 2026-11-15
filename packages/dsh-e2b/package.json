@@ -1,0 +1,60 @@
+{
+  "name": "@brain/dsh-e2b",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "E2B sandbox runtime for DSH: per-user / per-project / per-session microVMs behind a swappable platform contract.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./sandboxes": {
+      "types": "./lib/registry.d.ts",
+      "default": "./lib/registry.js"
+    },
+    "./fs": {
+      "types": "./lib/fs.d.ts",
+      "default": "./lib/fs.js"
+    },
+    "./subprocess": {
+      "types": "./lib/subprocess.d.ts",
+      "default": "./lib/subprocess.js"
+    },
+    "./sandbox": {
+      "types": "./lib/sandbox.d.ts",
+      "default": "./lib/sandbox.js"
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@brain/dsh-database": "*",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-fs": "*",
+    "@deepseek-ai/dsh-fs-patch": "*",
+    "@deepseek-ai/dsh-sandbox": "*",
+    "@deepseek-ai/dsh-subprocess": "*"
+  },
+  "dependencies": {
+    "e2b": "^2.31.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

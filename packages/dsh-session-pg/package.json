@@ -1,0 +1,30 @@
+{
+  "name": "@brain/dsh-session-pg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PostgreSQL session persistence with a cross-process write lease.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@brain/dsh-database": "*",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session-persistence": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

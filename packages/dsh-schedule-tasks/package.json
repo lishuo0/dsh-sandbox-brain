@@ -1,0 +1,30 @@
+{
+  "name": "@brain/dsh-schedule-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Session reminders for hand/brain separation. Tools write dsh_schedule_tasks; the platform claims due rows and delivers them through SendMessage. This package does not run a timer and does not call the platform.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

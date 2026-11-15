@@ -1,0 +1,29 @@
+{
+  "name": "@brain/dsh-web-limiter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-user and global concurrency limit for web_fetch tool calls.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}
