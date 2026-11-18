@@ -24,11 +24,11 @@ sessionId → { userId, workspaceId }
 
 ```ts
 const owner = await ctx.sessionDirectory.owner(sessionId)
-// { userId, workspaceId, volumeName?, guestRoot?, skillsVolume?, skillGroups?, mcpGroups? } 或 undefined
+// { userId, workspaceId, volumeName?, skillsVolume?, skillGroups?, mcpGroups? } 或 undefined
 ```
 
-`guestRoot` 来自 `dsh_workspaces.guest_root`，平台也用它作为会话 cwd；沙箱注册表按它决定
-workspace 前缀的挂载点。
+工作区独占一台沙箱，沙箱里只挂这块工作区的工作卷，所以所有工作区的挂载点和会话 cwd
+都是同一个固定路径（`/desk`）。沙箱注册表自己决定这个路径，owner 只负责告诉它卷名。
 
 ## 缓存是必需的
 

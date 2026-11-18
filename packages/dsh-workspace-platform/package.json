@@ -1,0 +1,31 @@
+{
+  "name": "@brain/dsh-workspace-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkspaceRegistry projection over the platform's dsh_workspaces table. The platform owns workspace writes; this service only reads and mirrors the platform state into the brain.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "peerDependencies": {
+    "@brain/dsh-database": "*",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-workspace": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

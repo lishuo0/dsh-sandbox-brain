@@ -1,13 +1,17 @@
 /**
  * Bridges HTTP routes onto DSH's in-process services.
  *
- * Everything here is a plain service call — no Typert, no descriptors. That is
- * the point: the REST contract is ours, and DSH is only asked to do the work.
+ * Nearly everything here is a plain service call — no Typert, no descriptors.
+ * That is the point: the REST contract is ours, and DSH is only asked to do the
+ * work. The one exception is {@link BrainGateway.remote}: the forwarded
+ * `schedule` namespace only exists as a Typert Remote, so it is invoked through
+ * the gateway's in-process dispatcher with an owner Peer the platform creates.
  *
  * @module @brain/dsh-platform-api/gateway
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { Peer } from '@deepseek-ai/dsh-client-connection'
 import {
   type Agent,
   type AgentHandle,
@@ -81,19 +85,61 @@ export function forgetSession(sessionId: string): void {
   SEEN_REQUESTS.delete(sessionId)
 }
 
-/** A committed event as the API exposes it. */
+/**
+ * A committed event as the API exposes it.
+ *
+ * `surfaceOp`/`sourceEventSeqs` are the log's surface metadata: the browser's
+ * session store requires them on surface-eligible event types and rejects the
+ * whole history when they go missing. `ignorable` marks plugin records older
+ * readers may skip. All three stay optional because log-only events never
+ * carry them (upstream forbids it).
+ */
 export interface ApiEvent {
   readonly seq: number
   readonly type: string
   readonly data: unknown
+  readonly surfaceOp?: unknown
+  readonly sourceEventSeqs?: unknown
+  readonly ignorable?: boolean
+}
+
+/**
+ * Read one committed event as the API shape.
+ *
+ * Surface metadata only exists on surface-eligible variants; copy it through
+ * untouched so the browser rebuilds the same ordered surface.
+ */
+export function apiEventOf(event: SessionEvent): ApiEvent {
+  const surface = event as unknown as { surfaceOp?: unknown; sourceEventSeqs?: unknown; ignorable?: unknown }
+  return {
+    seq: event.seq,
+    type: event.type,
+    data: (event as unknown as { data?: unknown }).data ?? null,
+    ...(surface.surfaceOp === undefined ? {} : { surfaceOp: surface.surfaceOp }),
+    ...(surface.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: surface.sourceEventSeqs }),
+    ...(surface.ignorable === true ? { ignorable: true } : {}),
+  }
+}
+
+/** Default inactivity budget before an open turn is force-closed. */
+const DEFAULT_TURN_STALL_MS = 600_000
+
+/** Options the plugin hands the gateway. */
+export interface GatewayOptions {
+  /**
+   * How long a running turn may go without any progress before it is
+   * force-closed. `0` disables the watchdog.
+   */
+  readonly turnStallMs?: number
 }
 
 /**
  * Build the gateway over the plugin's context.
  * @param ctx - context carrying `agents` and the session event stream.
+ * @param options - runtime policy; the plugin passes the deployment config.
  * @returns the gateway the routes call.
  */
-export function createGateway(ctx: Context): BrainGateway {
+export function createGateway(ctx: Context, options: GatewayOptions = {}): BrainGateway {
   /** In-flight create/resume per session, so duplicate HTTP calls share one load. */
   const opening = new Map<string, Promise<void>>()
   /** Owned handles let a stuck turn be force-disposed after cancel. */
@@ -199,6 +245,84 @@ export function createGateway(ctx: Context): BrainGateway {
     return result
   }
 
+  /** Inactivity budget for a running turn; `0` turns the watchdog off. */
+  const TURN_STALL_MS = options.turnStallMs ?? DEFAULT_TURN_STALL_MS
+  /** Running turns whose watchdog is armed, plus the timer itself. */
+  const stallTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Sessions whose stalled turn is already being closed, so it happens once. */
+  const closingStalled = new Set<string>()
+
+  /** Forget one turn's watchdog. */
+  const clearStall = (sessionId: string): void => {
+    const timer = stallTimers.get(sessionId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    stallTimers.delete(sessionId)
+  }
+
+  /**
+   * (Re)arm the inactivity budget for one running turn.
+   *
+   * Every signal that shows the turn is still making progress calls this with
+   * a fresh timer. When the budget expires nothing else has moved the turn,
+   * so the same last-resort path a user cancel takes closes it in the log and
+   * fences the live Agent out.
+   */
+  const armStall = (sessionId: string): void => {
+    if (TURN_STALL_MS <= 0) return
+    clearStall(sessionId)
+    const timer = setTimeout(() => {
+      stallTimers.delete(sessionId)
+      if (closingStalled.has(sessionId)) return
+      closingStalled.add(sessionId)
+      ctx.logger?.warn?.(
+        `platform-api: turn stalled for "${sessionId}" after ${TURN_STALL_MS}ms with no progress; closing it`,
+      )
+      void forceCloseTurn(sessionId)
+        .catch(error => {
+          ctx.logger?.warn?.(`platform-api: closing a stalled turn for "${sessionId}" failed: ${String(error)}`)
+        })
+        .finally(() => closingStalled.delete(sessionId))
+    }, TURN_STALL_MS)
+    // A stalled session must not keep the process alive on its own.
+    timer.unref?.()
+    stallTimers.set(sessionId, timer)
+  }
+
+  /** Restart the budget only for turns the watchdog already tracks. */
+  const touchStall = (sessionId: string): void => {
+    if (!stallTimers.has(sessionId) || closingStalled.has(sessionId)) return
+    armStall(sessionId)
+  }
+
+  ctx.effect(() => {
+    const disposers: Array<() => unknown> = [
+      ctx.on('agent/status', payload => {
+        const id = String(payload.agent.session.id)
+        if (payload.status === 'running') armStall(id)
+        else clearStall(id)
+      }),
+      // Durable activity, live model streaming and background-job progress all
+      // prove the turn is alive; an idle session with a running job has no
+      // armed timer, so job output never starts closing anything by itself.
+      ctx.on('session/event', session => touchStall(String(session.id))),
+      ctx.on('agent/assistant-stream', payload => touchStall(String(payload.agent.session.id))),
+    ]
+    const registry = ctx.get('jobs') as JobRegistry | undefined
+    if (registry !== undefined) {
+      disposers.push(registry.events.subscribe({ owners: 'all' }, event => {
+        const owner = event.type === 'output' ? event.owner : event.job.owner
+        if (owner !== undefined) touchStall(String(owner))
+      }))
+    }
+    return () => {
+      for (const dispose of disposers) dispose()
+      for (const timer of stallTimers.values()) clearTimeout(timer)
+      stallTimers.clear()
+      closingStalled.clear()
+    }
+  }, 'platform-api: turn stall watchdog')
+
   /** The session log already folds model/selection; resume does not replay it. */
   const restoreSelection = (_agent: Agent): void => {}
 
@@ -207,6 +331,7 @@ export function createGateway(ctx: Context): BrainGateway {
     forgetSession(id)
     opening.delete(id)
     handles.delete(id)
+    clearStall(id)
   })
 
   /** Read one session's live Agent. */
@@ -222,11 +347,7 @@ export function createGateway(ctx: Context): BrainGateway {
   }
 
   /** Read one committed event as the API shape. */
-  const toApiEvent = (event: SessionEvent): ApiEvent => ({
-    seq: event.seq,
-    type: event.type,
-    data: (event as unknown as { data?: unknown }).data ?? null,
-  })
+  const toApiEvent = apiEventOf
 
   return {
     async models() {
@@ -256,6 +377,10 @@ export function createGateway(ctx: Context): BrainGateway {
         }],
         failures: [],
       }
+    },
+
+    async registerModels(provider, models) {
+      for (const model of models) await ensureProviderModel(ctx, provider, model)
     },
 
     async selectModel(sessionId, selection) {
@@ -312,12 +437,18 @@ export function createGateway(ctx: Context): BrainGateway {
       return commands.list(agentFor(sessionId))
     },
 
-    async executeCommand(sessionId, line) {
+    async executeCommand(sessionId, line, attachments) {
       const commands = ctx.get('commands') as {
         execute(agent: Agent, line: string, attachments: readonly never[], signal: AbortSignal): Promise<unknown>
       } | undefined
       if (commands === undefined) throw new HttpError(501, 'not-supported', 'commands are not composed')
-      return commands.execute(agentFor(sessionId), line, [], new AbortController().signal)
+      const agent = agentFor(sessionId)
+      // A command runs outside any model turn. Handlers that end up calling the
+      // model (compaction, goal rounds) resolve the session key and the model
+      // catalog through `agents.currentInitiator()`, so the command must run
+      // inside this Agent's initiator boundary.
+      return ctx.agents.withInitiator(agent, () =>
+        commands.execute(agent, line, (attachments ?? []) as readonly never[], new AbortController().signal))
     },
 
     async goal(sessionId) {
@@ -431,6 +562,28 @@ export function createGateway(ctx: Context): BrainGateway {
       return presets.catalog()
     },
 
+    async remote(namespace, method, args) {
+      const gateway = ctx.get('typertGateway') as {
+        invoke?(request: {
+          namespace: string
+          method: string
+          args: Record<string, unknown>
+          peer: unknown
+        }): Promise<unknown>
+      } | undefined
+      if (gateway?.invoke === undefined) {
+        throw new HttpError(501, 'not-supported', 'the remote gateway is not composed')
+      }
+      // 调用方只有平台应用凭据；参数（例如成员会话范围）已经由平台补好。
+      // owner Peer 只活这一次调用，避免在脑里留下连接级注册。
+      const peer = new Peer(ctx, { principal: { kind: 'owner' } })
+      try {
+        return await gateway.invoke({ namespace, method, args, peer })
+      } finally {
+        await peer.dispose()
+      }
+    },
+
     async create(input) {
       const sessionId = input.sessionId ?? `session-${crypto.randomUUID()}`
       const existing = ctx.agents.get(sessionId as never)
@@ -519,7 +672,7 @@ export function createGateway(ctx: Context): BrainGateway {
       return { sessionId }
     },
 
-    async prompt(sessionId, text, requestId) {
+    async prompt(sessionId, text, requestId, mode) {
       const agent = agentFor(sessionId)
       if (!reserveRequest(sessionId, requestId)) return
       // The durable message factory supplies the stable id and `role`; a
@@ -531,19 +684,58 @@ export function createGateway(ctx: Context): BrainGateway {
         source: { kind: 'user', rpcId: requestId },
       })
       try {
-        // `followup` queues a turn and wakes the driver. `steer` would fold the
-        // text into the running turn — the platform decides which by calling a
-        // different endpoint once the product needs it.
-        agent.followup(message as never)
+        // `queue` starts or queues a turn; `steer` folds the text into the
+        // turn that is already running at its next step boundary. They are
+        // different Agent operations, not two spellings of one.
+        if (mode === 'steer') agent.steer(message as never)
+        else agent.followup(message as never)
       } catch (error) {
         releaseRequest(sessionId, requestId)
         throw new HttpError(409, 'prompt-rejected', error instanceof Error ? error.message : String(error))
       }
     },
 
+    async fork(sessionId, request) {
+      // Fork copies the committed log, which only exists in the brain; the
+      // session controller owns that machinery (`buildForkSeed` + create).
+      const controller = ctx.get('sessionController') as {
+        fork(request: { sessionId: string; atSeq?: number }): Promise<{ sessionId: string }>
+      } | undefined
+      if (controller === undefined) throw new HttpError(501, 'not-supported', 'fork is not composed')
+      try {
+        const forked = await controller.fork({
+          sessionId,
+          ...(request.atSeq === undefined ? {} : { atSeq: request.atSeq }),
+        })
+        ctx.logger?.info?.(`platform-api: forked "${sessionId}" → "${forked.sessionId}"`)
+        return { sessionId: forked.sessionId }
+      } catch (error) {
+        const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined
+        if (code === 'session/not-found') {
+          throw new HttpError(404, 'session-not-found', error instanceof Error ? error.message : String(error))
+        }
+        const conflict: Record<string, string> = {
+          'session/fork-unavailable': 'fork-unavailable',
+          'session/migration-required': 'fork-migration-required',
+          'gateway/bad-request': 'fork-unavailable',
+        }
+        if (typeof code === 'string' && conflict[code] !== undefined) {
+          throw new HttpError(409, conflict[code], error instanceof Error ? error.message : String(error))
+        }
+        throw new HttpError(500, 'fork-failed', error instanceof Error ? error.message : String(error))
+      }
+    },
+
     async cancel(sessionId) {
-      const agent = agentFor(sessionId)
+      const agent = ctx.agents.get(sessionId as never)
       ctx.logger?.info?.(`platform-api: cancel.requested for "${sessionId}"`)
+      // No live Agent still has work to cancel: a replica restart can leave the
+      // durable log with an open turn. Reconcile it rather than answering 404,
+      // so the same endpoint repairs an abnormal session.
+      if (agent === undefined) {
+        await forceCloseTurn(sessionId)
+        return
+      }
       // Keep the inbox: cancel stops the current turn, not queued input.
       agent.cancel({ kind: 'user' }, { keepInbox: true })
       // Background jobs outlive their turn by design. A user cancel must stop
@@ -566,7 +758,7 @@ export function createGateway(ctx: Context): BrainGateway {
 
     async head(sessionId) {
       const agent = agentFor(sessionId)
-      return { cursor: Number(agent.session.seq) - 1 }
+      return { cursor: Number(agent.session.seq) - 1, running: agent.status === 'running' }
     },
 
     async events(sessionId, after, limit) {
@@ -683,7 +875,15 @@ export function createGateway(ctx: Context): BrainGateway {
         ctx.on('session/event', (session, event) => {
           if (session.id !== sessionId) return
           const api = toApiEvent(event)
-          listener({ kind: 'event', seq: api.seq, type: api.type, data: api.data })
+          listener({
+            kind: 'event',
+            seq: api.seq,
+            type: api.type,
+            data: api.data,
+            ...(api.surfaceOp === undefined ? {} : { surfaceOp: api.surfaceOp }),
+            ...(api.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: api.sourceEventSeqs }),
+            ...(api.ignorable === true ? { ignorable: true } : {}),
+          })
         }),
         ctx.on('agent/assistant-stream', payload => {
           if (payload.agent.session.id !== sessionId) return
@@ -806,8 +1006,20 @@ function* outputFrames(read: JobOutputRead): Iterable<JobFollowFrame> {
  * cannot see; both must look identical, or job ids become an enumeration
  * oracle.
  */
-function jobError(error: unknown, sessionId: string, jobId: string): HttpError {
+export function jobError(error: unknown, sessionId: string, jobId: string): HttpError {
   const message = error instanceof Error ? error.message : String(error)
+  // Route on the registry's stable contract first. The text pattern below only
+  // covers registries that predate `JobError.code`.
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined
+  if (code === 'JOB_NOT_FOUND' || code === 'JOB_FOREIGN_SESSION') {
+    return new HttpError(404, 'job-not-found', `job "${jobId}" is not visible to session "${sessionId}"`)
+  }
+  if (code === 'JOB_OWNER_NOT_LIVE') {
+    return new HttpError(409, 'job-owner-not-live', `job "${jobId}" lost its owning session`)
+  }
+  if (code === 'JOB_CONTROLLER_UNAVAILABLE') {
+    return new HttpError(501, 'not-supported', 'no job controller serves this session')
+  }
   if (/unknown|foreign|not found|not visible|cannot see/i.test(message)) {
     return new HttpError(404, 'job-not-found', `job "${jobId}" is not visible to session "${sessionId}"`)
   }

@@ -182,15 +182,25 @@ function integerQuery(req: IncomingMessage, name: string): number | undefined {
   return value
 }
 
+/**
+ * 这条会话属于哪块工作区。
+ *
+ * 以库里的会话归属为准；请求头只是调用方的断言。不一致就拒绝——工作区决定挂哪块
+ * 持久卷，把判定权交给请求头等于让任何持有 app key 的调用方把 A 的会话接到 B 的卷上。
+ */
 async function workspaceIdOf(ctx: Context, req: IncomingMessage, sessionId: string): Promise<string> {
   const header = req.headers['x-dsh-workspace-id']
   const fromHeader = Array.isArray(header) ? header[0] : header
-  if (typeof fromHeader === 'string' && fromHeader.trim() !== '') return fromHeader.trim()
+  const asserted = typeof fromHeader === 'string' ? fromHeader.trim() : ''
   const directory = ctx.get('sessionDirectory') as {
     owner?: (id: string) => Promise<{ workspaceId?: string } | undefined>
   } | undefined
   const owner = await directory?.owner?.(sessionId)
-  return owner?.workspaceId?.trim() ?? ''
+  const resolved = owner?.workspaceId?.trim() ?? ''
+  if (asserted !== '' && resolved !== '' && asserted !== resolved) {
+    throw new HttpError(403, 'workspace/mismatch', 'the Session does not belong to that workspace')
+  }
+  return resolved !== '' ? resolved : asserted
 }
 
 async function openFiles(ctx: Context, sessionId: string): Promise<{ root: string; files: SandboxFiles }> {

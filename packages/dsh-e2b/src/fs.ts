@@ -28,6 +28,9 @@ import type {
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 import { applyHunks, type PatchHunk } from '@deepseek-ai/dsh-fs-patch'
+import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
+// Side-effect type import: declaration-merges `ctx.sandboxPolicy`.
+import type {} from '@deepseek-ai/dsh-sandbox-policy'
 /** Largest prior file content retained as a diff basis, in bytes. */
 const MAX_DIFF_BASIS_BYTES = 1_048_576
 
@@ -36,14 +39,16 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true })
 
 /** File provider backed by a sandbox. */
 export default class E2bFileSystem extends FileSystem {
-  static readonly inject = ['sandboxes']
+  static readonly inject = ['sandboxes', 'sandboxPolicy']
 
   /**
-   * The sandbox is the isolation boundary: the VM only contains this tenant's
-   * workspace, so the process-level file policy adds nothing here.
+   * The deployment default mode. The VM is the isolation boundary between
+   * tenants, but a mode still decides whether the model's own file tools may
+   * mutate at all (`read-only`) and where (`workspace-write`), so it must be
+   * advertised here — `dsh-tool-fs` builds its escalation surface from this.
    */
-  override get sandboxMode(): 'danger-full-access' {
-    return 'danger-full-access'
+  override get sandboxMode(): SandboxMode {
+    return this.ctx.sandboxPolicy.defaultMode
   }
 
   override async resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget> {
@@ -166,9 +171,10 @@ export default class E2bFileSystem extends FileSystem {
     content: string,
     expected?: FsWriteIntent,
     signal?: AbortSignal,
-    _policy?: unknown,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome> {
     signal?.throwIfAborted()
+    this.assertMutable(target, sandboxPolicy)
     const client = await this.client()
     const path = this.path(target)
     const existing = await client.files.stat(path)
@@ -205,9 +211,10 @@ export default class E2bFileSystem extends FileSystem {
     edit: FsEditRequest,
     expected?: { version: unknown },
     signal?: AbortSignal,
-    _policy?: unknown,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
     signal?.throwIfAborted()
+    this.assertMutable(target, sandboxPolicy)
     const client = await this.client()
     const path = this.path(target)
     const existing = await client.files.stat(path)
@@ -240,8 +247,10 @@ export default class E2bFileSystem extends FileSystem {
     hunks: readonly PatchHunk[],
     expected?: { version: FsVersion },
     signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
     signal?.throwIfAborted()
+    this.assertMutable(target, sandboxPolicy)
     const client = await this.client()
     const path = this.path(target)
     const existing = await requireFile(client, path, target.displayPath, expected)
@@ -266,8 +275,10 @@ export default class E2bFileSystem extends FileSystem {
     target: FsTarget,
     expected?: { version: FsVersion },
     signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsDeleteOutcome> {
     signal?.throwIfAborted()
+    this.assertMutable(target, sandboxPolicy)
     const client = await this.client()
     const path = this.path(target)
     const existing = await requireFile(client, path, target.displayPath, expected)
@@ -286,11 +297,14 @@ export default class E2bFileSystem extends FileSystem {
       expectedDestination?: FsWriteIntent
     },
     signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsMoveOutcome> {
     if (String(source.targetKey) === String(destination.targetKey)) {
       throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
     }
     signal?.throwIfAborted()
+    this.assertMutable(source, sandboxPolicy)
+    this.assertMutable(destination, sandboxPolicy)
     const client = await this.client()
     const sourcePath = this.path(source)
     await requireFile(client, sourcePath, source.displayPath, options.expectedSource)
@@ -326,6 +340,30 @@ export default class E2bFileSystem extends FileSystem {
       }
     }
     return { sourceBefore, destination: destinationOutcome, sourceDeleted: true }
+  }
+
+  /**
+   * Enforce the per-call file-effect policy for one mutation.
+   *
+   * `read-only` denies every mutation; `workspace-write` requires the VM path to
+   * sit under a writable root; `danger-full-access` allows it. A missing policy
+   * means an internal platform caller (upload, preview, export) rather than a
+   * model tool — the VM boundary is still the tenant fence, so it passes.
+   */
+  private assertMutable(target: FsTarget, policy: SandboxExecutionPolicy | undefined): void {
+    if (policy === undefined || policy.mode === 'danger-full-access') return
+    if (policy.mode === 'read-only') {
+      throw new FsError(`cannot write "${target.displayPath}": file access denied under read-only mode`, 'FS_SANDBOX_DENIED')
+    }
+    const path = this.path(target)
+    // These are VM paths. Upstream's `writableRoots` resolves them against the
+    // harness host (realpath, /tmp and os.tmpdir grants), which is both blind to
+    // the VM and would canonicalize a mock adapter's host-shaped root.
+    const roots = [policy.workspaceRoot, ...(policy.additionalWritableRoots ?? []), '/tmp'].map((root) => posix.resolve(root))
+    for (const root of roots) {
+      if (isUnder(path, root)) return
+    }
+    throw new FsError(`cannot write "${target.displayPath}": file access denied under workspace-write mode`, 'FS_SANDBOX_DENIED')
   }
 
   /** The binding serving the initiating turn. */
@@ -419,6 +457,12 @@ async function writeAtomic(
 /** LF-normalize storage text for the diff basis. */
 function normalizeLineEndings(text: string): string {
   return text.replaceAll('\r\n', '\n')
+}
+
+/** Whether a VM path sits at or under a writable root (both POSIX-spelled). */
+function isUnder(path: string, root: string): boolean {
+  const relative = posix.relative(root, path)
+  return relative === '' || (!relative.startsWith('../') && relative !== '..' && !posix.isAbsolute(relative))
 }
 
 /** Apply one literal edit, enforcing uniqueness unless `replaceAll`. */

@@ -18,6 +18,7 @@
     "@brain/dsh-database": "file:../../packages/dsh-database",
     "@brain/dsh-session-pg": "file:../../packages/dsh-session-pg",
     "@brain/dsh-session-directory": "file:../../packages/dsh-session-directory",
+    "@brain/dsh-workspace-platform": "file:../../packages/dsh-workspace-platform",
     "@brain/dsh-web-limiter": "file:../../packages/dsh-web-limiter",
     "@brain/dsh-credentials-session": "file:../../packages/dsh-credentials-session",
     "@brain/dsh-user-skills": "file:../../packages/dsh-user-skills",
@@ -26,6 +27,9 @@
     "@brain/dsh-attachment-oss": "file:../../packages/dsh-attachment-oss",
     "@brain/dsh-schedule-tasks": "file:../../packages/dsh-schedule-tasks",
     "@brain/dsh-workspace-policy": "file:../../packages/dsh-workspace-policy",
-    "@brain/dsh-browser-auth-store": "file:../../packages/dsh-browser-auth-store"
+    "@brain/dsh-browser-auth-store": "file:../../packages/dsh-browser-auth-store",
+    "@deepseek-ai/dsh-api-job-controller": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-settings-general": "0.2.2-rc.3"
   }
 }

@@ -1,5 +1,5 @@
 /**
- * PostgreSQL implementation of the binding store.
+ * Database-backed implementation of the binding store (PostgreSQL or SQLite).
  *
  * The in-memory store is correct but single-process: two replicas would each
  * create their own sandbox for the same session. This one keeps the binding in
@@ -28,7 +28,7 @@ interface BindingRow {
   last_used_at: Date | string
 }
 
-/** Durable bindings in PostgreSQL. */
+/** Durable bindings in the shared database. */
 export class PgBindingStore implements BindingStore {
   constructor(
     private readonly ctx: Context,
@@ -114,6 +114,7 @@ export class PgBindingStore implements BindingStore {
    * is taken over with a higher generation.
    */
   async claim(key: SandboxKey, claimId: string, leaseMs: number): Promise<ClaimResult> {
+    const expiresAt = new Date(Date.now() + leaseMs).toISOString()
     return await this.db.transaction(async run => {
       const rows = await run<BindingRow>(
         `SELECT * FROM dsh_sandboxes
@@ -127,9 +128,8 @@ export class PgBindingStore implements BindingStore {
           `INSERT INTO dsh_sandboxes (
              user_id, workspace_id, session_id, scope, sandbox_id, external_id,
              endpoint, workspace_root, generation, state, expires_at, last_used_at
-           ) VALUES ($1, $2, $3, $4, $5, '', '', '', 1, 'creating',
-                     now() + ($6 || ' milliseconds')::interval, now())`,
-          [key.userId, key.workspaceId, key.sessionId, this.scope, claimId, String(leaseMs)],
+           ) VALUES ($1, $2, $3, $4, $5, '', '', '', 1, 'creating', $6, now())`,
+          [key.userId, key.workspaceId, key.sessionId, this.scope, claimId, expiresAt],
         )
         return { status: 'claimed', generation: 1 }
       }
@@ -141,10 +141,10 @@ export class PgBindingStore implements BindingStore {
         `UPDATE dsh_sandboxes
             SET state = 'creating', sandbox_id = $4, external_id = '', endpoint = '',
                 workspace_root = '', generation = $5,
-                expires_at = now() + ($6 || ' milliseconds')::interval,
+                expires_at = $6,
                 last_used_at = now()
           WHERE user_id = $1 AND workspace_id = $2 AND session_id = $3`,
-        [key.userId, key.workspaceId, key.sessionId, claimId, generation, String(leaseMs)],
+        [key.userId, key.workspaceId, key.sessionId, claimId, generation, expiresAt],
       )
       return { status: 'claimed', generation }
     })

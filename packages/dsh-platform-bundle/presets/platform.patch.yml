@@ -1,25 +1,40 @@
-# The `platform` agent template: what the model can actually do.
+# The `platform` agent template: persona and the tools the profile cannot
+# register globally.
 #
-# Sandbox status of the tools this preset exposes (see @brain/dsh-e2b):
+# Tool rows in `@deepseek-ai/dsh-base` register at host scope, so they are
+# visible to every session and this preset must not re-register them: a child
+# row with the same tool name would shadow the host row and silently drop its
+# config. The host rows enabled by `profile/api/cordis.patch.yml` are:
 #
-#   bash            ✅ sandbox   ctx.shell → ctx.subprocess → E2B
-#   read/write/edit ✅ sandbox   ctx.fs → E2B
-#   job_*           ⚠️ partial   processes run in the sandbox; the job registry
-#                                is brain-local and is lost on restart
-#   web_fetch       ❌ brain     anonymous public HTTP, bounded and limited by
-#                                @brain/dsh-web-limiter (enabled)
-#   web_search      ❌ disabled  one search is a full model call sharing the key
-#   goal/todo/plan  ✅ session   state events in the session log; tools are
-#                                host-scope and enabled by the profile
+#   bash             ✅ sandbox   ctx.shell → ctx.subprocess → E2B
+#   read/write/edit  ✅ sandbox   ctx.fs → E2B (apply_patch off)
+#   job_*            ⚠️ partial   processes run in the sandbox; the job registry
+#                                 is brain-local and lost on restart
+#   subagent, subagent_fork,
+#   list_agents, send_message,
+#   wait_agent       ✅ shared    children resolve to the parent's workspace
+#                                 and reuse its sandbox key (interrupt_agent
+#                                 stays off: base sets interrupt:false)
+#   skill            ✅ sandbox   @brain/dsh-user-skills reads the read-only
+#                                 skill mounts through ctx.fs
+#   schedule_*       ✅ platform  @brain/dsh-schedule-tasks writes the shared DB
+#   web_fetch        ❌ brain     anonymous public HTTP, bounded by
+#                                 @brain/dsh-web-limiter; web_search is off
+#   create/get/update_goal,
+#   todo_write,
+#   exit_plan_mode   ✅ session   goal/todo/plan events in the session log
+#   team_task_*      ✅ conditional only in Team mode; discovery is gated by
+#                                 ctx.agentTeams.isEnabled
 #
-# Host-scope tools from dsh-base are NOT filtered by this preset; the profile
-# must disable every host-only tool row explicitly.
+# This preset adds what the base does NOT register:
 #
-# Deliberately absent, for the first phase:
+#   ask_user_question ✅ platform  ctx.userQuestions; answers arrive over the
+#                                  platform's /api interactions channel
+#   present           ✅ sandbox   validates files through ctx.fs and records
+#                                  them as deliverables for the client UI
 #
-#   (subagents are ENABLED at host scope by the profile: a child session
-#    resolves to the parent's workspace and shares its sandbox; a brain
-#    restart still drops the waiting parent, accepted for this phase.)
+# Deliberately absent:
+#
 #   tool-workflow / workflow-ptc
 #       Orchestration state lives in the process.
 #   terminal-*
@@ -27,17 +42,23 @@
 #   fs-search
 #       Spawns the brain-hosted @vscode/ripgrep binary; that path does not
 #       exist inside the sandbox. Use bash + grep/rg in the sandbox instead.
-#   skill
-#       The shipped skill provider scans the brain's filesystem, not the
-#       sandbox; per-user skills are a later phase.
+#   skill-filesystem
+#       It scans the brain's filesystem; per-user skills come from
+#       @brain/dsh-user-skills over the sandbox mounts instead.
 #   read_image / attachments
 #       The image tool needs the brain-side attachment store, whose files are
 #       shared by every tenant; the profile disables `attachment-local` so the
-#       tool never registers. Image input returns when uploads get per-user
-#       storage and ownership checks.
+#       tool never registers.
+#   tool-office
+#       Needs a WebSocket-based skill provider this deployment does not mount.
 #
 # Re-introduce each one only after its execution world and cross-replica
 # behaviour are settled.
+#
+# The client's read-only preset viewer renders only the declared `plugins` list
+# below; it does not expand host-scope tools. So `description` names the host
+# capabilities the mode actually has, otherwise the card reads like the whole
+# tool catalog is these five plugins.
 
 - insert:
     - id: preset-platform
@@ -45,23 +66,26 @@
       config:
         id: platform
         name: 标准模式
-        description: 默认的通用 Agent 组合
+        # 客户端预设页只展开下面声明的 plugins，不会列出宿主注册的工具，
+        # 所以描述里要写全这个模式实际能用的能力，否则卡片看起来只有五个插件。
+        description: 平台默认模式。bash、文件读写、后台任务、技能、定时任务、子代理、目标与待办由宿主统一注册；本预设补充人设提示词、时间上下文、提问和产物展示。
         order: 1
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by the {{model}} model.
 
           - id: instructions
             name: '@deepseek-ai/dsh-agent-instructions'
-
-          - id: bash
-            name: '@deepseek-ai/dsh-tool-bash'
-
-          - id: fs
-            name: '@deepseek-ai/dsh-tool-fs'
-
-          - id: jobs
-            name: '@deepseek-ai/dsh-tool-jobs'
+            config:
+              maxBytes: 65536
 
           - id: time
             name: '@deepseek-ai/dsh-time-context'
+
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'

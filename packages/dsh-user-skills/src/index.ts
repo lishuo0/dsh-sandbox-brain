@@ -29,9 +29,21 @@ export interface Config {
   readonly publicRoot?: string
 }
 
+interface WorkspaceSelection {
+  name: string
+  scope: 'private' | 'public'
+}
+
+interface SessionOwnerLike {
+  userId: string
+  /** undefined = 工作区没配置过，沿用全部启用；空数组 = 明确不接入任何技能。 */
+  skills?: readonly WorkspaceSelection[]
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     sessionDirectory?: {
+      ownerOf(sessionId: string): Promise<SessionOwnerLike | undefined>
       userOf(sessionId: string): Promise<{ userId: string } | undefined>
     }
   }
@@ -43,7 +55,7 @@ const PUBLIC_ROOT = '/skillbox/common'
 interface SkillRow {
   name: string
   description: string
-  scope: string
+  scope: 'private' | 'public'
 }
 
 interface SandboxFs {
@@ -60,16 +72,30 @@ export default class UserSkillsPlugin {
   constructor(ctx: Context, config: Config = {}) {
     const privateRoot = normalizeRoot(config.privateRoot, PRIVATE_ROOT)
     const publicRoot = normalizeRoot(config.publicRoot, PUBLIC_ROOT)
+    // 平台只改库、不通知脑。技能目录按 revision 缓存，这里在每个 pre-step 前
+    // 作废一次，停用 / 启用 / 新增才能在既有会话的下一个回合生效。
+    const controls = new WeakMap<object, SkillProviderControl>()
+    ctx.on('agent/pre-step', ({ agent }, next) => {
+      controls.get(agent)?.invalidate()
+      return next()
+    })
     ctx.on('agent/created', async ({ agent }) => {
       const directory = ctx.get('sessionDirectory') as
-        | { userOf(sessionId: string): Promise<{ userId: string } | undefined> }
+        | {
+            ownerOf(sessionId: string): Promise<SessionOwnerLike | undefined>
+            userOf(sessionId: string): Promise<{ userId: string } | undefined>
+          }
         | undefined
-      const user = await directory?.userOf(agent.session.id)
+      // ownerOf 带工作区选择；没有工作区（老会话）时退回 userOf，沿用全部启用。
+      const owner = await directory?.ownerOf(agent.session.id)
+      const user = owner ?? await directory?.userOf(agent.session.id)
       if (user === undefined) return
+      const selection = 'skills' in user ? (user.skills as readonly WorkspaceSelection[] | undefined) : undefined
       agent.ctx.inject(['skills'], (scope) => {
-        scope.skills.registerProvider((control) =>
-          createProvider(ctx, control, user.userId, privateRoot, publicRoot, agent.ctx),
-        )
+        scope.skills.registerProvider((control) => {
+          controls.set(agent, control)
+          return createProvider(ctx, control, user.userId, selection, privateRoot, publicRoot, agent.ctx)
+        })
       })
     })
   }
@@ -79,10 +105,14 @@ function createProvider(
   ctx: Context,
   control: SkillProviderControl,
   userId: string,
+  selection: readonly WorkspaceSelection[] | undefined,
   privateRoot: string,
   publicRoot: string,
   agentCtx: Context,
 ): SkillProvider {
+  const selected = selection === undefined
+    ? undefined
+    : new Set(selection.map((item) => `${item.scope}:${item.name}`))
   return {
     name: 'user-skills',
     async list(options: SkillLookupOptions): Promise<readonly SkillCandidate[]> {
@@ -96,6 +126,7 @@ function createProvider(
       )
       const chosen = new Map<string, SkillRow>()
       for (const row of rows) {
+        if (selected !== undefined && !selected.has(`${row.scope}:${row.name}`)) continue
         const current = chosen.get(row.name)
         if (current === undefined || (current.scope !== 'private' && row.scope === 'private')) {
           chosen.set(row.name, row)

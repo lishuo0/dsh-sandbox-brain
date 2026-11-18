@@ -10,6 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-tools'
+import { ScheduleRemoteService } from './remote.ts'
 import { registerTools } from './tools.ts'
 import type { ScheduleDB } from './tasks.ts'
 
@@ -17,5 +18,8 @@ export const name = 'schedule-tasks'
 export const inject = ['tools', 'db', 'agents']
 
 export function apply(ctx: Context): void {
-  registerTools(ctx, (ctx as Context & { db: ScheduleDB }).db)
+  const db = (ctx as Context & { db: ScheduleDB }).db
+  registerTools(ctx, db)
+  // 官方客户端定时任务页读的 Remote 面；平台代理补会话范围。
+  ctx.plugin(ScheduleRemoteService, db)
 }

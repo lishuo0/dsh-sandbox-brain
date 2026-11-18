@@ -2,6 +2,9 @@
   "name": "dsh-brain",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24.9.0"
+  },
   "workspaces": [
     "packages/*",
     "profile/api"
@@ -9,18 +12,28 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "dev": "bash scripts/dev.sh",
+    "dev:status": "bash scripts/dev.sh status",
     "dev:stop": "bash scripts/dev.sh stop",
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts test/integration test/e2e",
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "@changfenhuang/dsh-genui": "0.16.0",
     "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/cordis-plugin-group": "~1.1.0",
     "@deepseek-ai/dsh": "0.2.2-rc.3",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.3",
     "@deepseek-ai/dsh-agent-preset-registry": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-api-workspace-files": "0.2.2-rc.3",
     "@deepseek-ai/dsh-attachment": "0.2.2-rc.3",
     "@deepseek-ai/dsh-attachment-local": "0.2.2-rc.3",
     "@deepseek-ai/dsh-base": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-settings-general": "0.2.2-rc.3",
     "@deepseek-ai/dsh-credentials": "0.2.2-rc.3",
     "@deepseek-ai/dsh-fs": "0.2.2-rc.3",
     "@deepseek-ai/dsh-fs-patch": "^0.2.2-rc.3",
@@ -45,9 +58,10 @@
   "devDependencies": {
     "@types/ali-oss": "^6.23.0",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.15.0",
+    "@types/node": "^24.9.0",
     "@types/pg": "^8.15.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.4"
   }
 }

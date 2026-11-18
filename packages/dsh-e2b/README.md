@@ -22,6 +22,8 @@ remote implementation.
 platform contract (contract.ts)     ← the only surface the rest depends on
         ↑ implements
 E2B adapter (e2b-adapter.ts)        ← the only file that knows E2B exists
+Docker adapter (docker-adapter.ts)  ← one container per workspace, local daemon
+Mock adapter (mock-adapter.ts)      ← host directories, no isolation
         ↑ used by
 SandboxRegistry (registry.ts)       ← routing, binding table, creation, reclamation
         ↑ used by
@@ -30,6 +32,13 @@ fs / subprocess / sandbox providers
 
 Swapping to another cloud vendor means writing a second `SandboxPlatform` +
 `SandboxClient` implementation. Nothing above `contract.ts` changes.
+
+The Docker adapter is the local default: it runs each workspace in its own
+container (`--user uid:gid`, `--cap-drop=ALL`, no-new-privileges, read-only
+rootfs, mounts only the workspace prefix plus read-only skill prefixes) and
+executes every file and process operation through `docker exec`. The local
+object directory is still a shared host tree keyed by workspace prefix, so this
+is development isolation, not a multi-tenant boundary.
 
 ## Routing
 
@@ -60,7 +69,7 @@ new SandboxRegistry(ctx, {
   scope: 'workspace',
   directory: ctx.get('sessionDirectory'),
   platform: new BoxPlatform(boxConfig),
-  volumeMountPath: '/desk/{workspaceId}',
+  volumeMountPath: '/desk',
   volumeNameTemplate: 'desk-{workspaceId}',
 })
 ```
@@ -77,14 +86,19 @@ so the injected platform only implements the control/data plane.
   config:
     scope: workspace
     adapter: e2b
+    # Local development instead of cloud: adapter: docker, with
+    # docker:
+    #   image: node:22-bookworm-slim   # needs sh, coreutils, find
+    #   objectDir: !!js process.env.DSH_LOCAL_STORE
+    #   network: none                  # set bridge to allow egress
     # One volume per workspace: workspaces.volume_name wins; otherwise the
     # template is rendered from the key. The sandbox mounts only that volume.
-    # The mount path comes from the owner's workspaces.guest_root when the
-    # platform records one (it is also the session cwd the platform sends), so
-    # this value is the fallback. {workspaceId}/{userId}/{sessionId} are
-    # rendered per sandbox; the result is both the mount path and the
-    # workspace root reported to tools.
-    volumeMountPath: /desk/{workspaceId}
+    # Every workspace owns its own sandbox, so the mount path is the same for
+    # all of them and is also the session cwd the platform sends. It must be
+    # absolute and non-root. {workspaceId}/{userId}/{sessionId} may be
+    # rendered, but normally there is no need: the mount path is both the
+    # mount point and the workspace root reported to tools.
+    volumeMountPath: /desk
     volumeNameTemplate: 'desk-{workspaceId}'
     # Temporary: one existing volume for every workspace. This disables
     # per-workspace file isolation; remove it once provisioning exists.
@@ -141,26 +155,35 @@ created the row and is what makes switching granularity safe.
 
 ## Model-facing tools and where they run
 
-The current profile (after the host-tool disables) exposes exactly 18 tools:
+The current profile plus the `platform` preset exposes 25 tools in a default
+session:
 
 | Tool | Sandbox status | Path |
 |---|---|---|
 | `bash` | ✅ sandbox | `ctx.shell` → `ctx.subprocess` → E2B |
-| `read` / `write` / `edit` | ✅ sandbox | `ctx.fs` → E2B |
+| `read` / `write` / `edit` | ✅ sandbox | `ctx.fs` → E2B (`apply_patch` is off) |
 | `job_list` / `job_output` / `job_kill` | ⚠️ partial | processes run in the sandbox; the job registry is brain-local and lost on brain restart |
-| `subagent` / `subagent_fork` / `list_agents` / `send_message` / `interrupt_agent` | ✅ shared parent sandbox | the child session resolves through `header.parentSession` to the platform-owned root and reuses its key |
+| `skill` | ✅ sandbox | `@brain/dsh-user-skills` reads the read-only skill mounts through `ctx.fs` |
+| `subagent` / `subagent_fork` / `list_agents` / `send_message` / `wait_agent` | ✅ shared parent sandbox | the child session resolves through `header.parentSession` to the platform-owned root and reuses its key (`interrupt_agent` stays off: base sets `interrupt: false`) |
 | `web_fetch` | ❌ brain | anonymous public HTTP with byte/char/time caps; concurrency limited by `@brain/dsh-web-limiter` |
 | `create_goal` / `get_goal` / `update_goal` / `todo_write` / `exit_plan_mode` | ✅ session state | per-session `goal/change`, `todo/write`, `plan/mode` events in the session log |
+| `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete` | ✅ platform | `@brain/dsh-schedule-tasks` writes `dsh_schedule_tasks`; no host files or processes |
+| `ask_user_question` | ✅ platform | the `user-questions` seam; answers arrive over the platform's `/api` interaction channel |
+| `present` | ✅ sandbox | validates files through `ctx.fs` and records them as deliverables for the client UI |
+| `team_task_*` | ✅ conditional | Team mode only: discovery is gated by `ctx.agentTeams.isEnabled`, so the tools stay hidden in normal sessions |
 
-The other 3 tools the base bundle exposes by default (`working_directory`,
-`web_search`, `read_image`) are disabled in the profile. `read_image` never
-registers because `attachment-local` is also disabled, which removes the
-brain-side attachment store this phase does not isolate per user. The full
-21-tool matrix — purpose, sandbox status, current state, and whether
-implementation is required — is in `docs/dsh多副本多租户技术方案.md` §8.4.
+The profile disables the tools that would run on the brain host:
+`working_directory`, `web_search`, `read_image`, `apply_patch` (via config
+`applyPatch: false`), `fs-search`, `skill-filesystem`, and `terminal-*` (PTY is
+not wired). `read_image` would never register anyway because `attachment-local`
+is disabled, which removes the brain-side attachment store this phase does not
+isolate per user. The placement rules behind these rows — which capabilities
+stay on the brain and which go through the file and process seams — are in
+`docs/技术方案.md` §6.
 
-`fs-search`, `skill`, and `terminal-*` are not exposed at all: the first two are
-disabled (they would run on the brain), and PTY is not wired.
+`present` is mounted by the `platform` preset because `dsh-base` has no such
+host row; so is `ask_user_question`. Neither re-registers a host tool, so
+neither shadows the host config.
 
 Only the ✅ rows are executed through this package. The preset alone does not
 remove host-scope tools; the profile must disable those rows.
@@ -175,6 +198,7 @@ Verified against `dsh-v0.2.1-alpha.2`. What is complete and what is not:
 | Registry: routing, in-flight dedupe, cross-replica creation claim (`PgBindingStore.claim`), sweeper, orphan reclaim | implemented; automatic timer disabled, `sweep()` is manual |
 | Registry persistence | in-memory (`MemoryBindingStore`) and PostgreSQL (`PgBindingStore`) |
 | SDK client | `e2b@^2.31.0`: create / connect / list / getInfo / kill / pause |
+| Local Docker adapter | one container per sandbox: files and processes via `docker exec`, read-only rootfs, dropped capabilities, workspace-only mounts |
 | Aliyun creation options | `apiUrl` / `domain` / `template` / `roleArn`; volumes resolved per workspace |
 | File provider: resolve / stat / lstat / read / stream / byte-range / list / write / edit / contains | complete; `stat` uses `files.getInfo` |
 | File version tokens | size + mtime fallback; no content hash |

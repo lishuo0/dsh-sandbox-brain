@@ -22,9 +22,13 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-agent": "*",
-    "@deepseek-ai/dsh-tools": "*"
+    "@deepseek-ai/dsh-schedule": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-schedule": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.3",
     "typescript": "^5.8.0"
   }
 }

@@ -11,9 +11,11 @@ import {
 
 export interface ScheduleDB {
   query<T = Record<string, unknown>>(text: string, params?: readonly unknown[]): Promise<T[]>
+  /** 本地 SQLite 与部署 PostgreSQL 的 DDL 类型不同；缺省按 PostgreSQL。 */
+  readonly dialect?: string
 }
 
-const CREATE_TABLE = `
+const CREATE_TABLE_PG = `
 CREATE TABLE IF NOT EXISTS dsh_schedule_tasks (
   id text PRIMARY KEY,
   session_id text NOT NULL,
@@ -40,6 +42,28 @@ CREATE INDEX IF NOT EXISTS dsh_schedule_tasks_due_idx
   ON dsh_schedule_tasks (next_run_at)
   WHERE status = 'active'`
 
+const CREATE_TABLE_SQLITE = `
+CREATE TABLE IF NOT EXISTS dsh_schedule_tasks (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  title text NOT NULL,
+  prompt text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('after', 'at', 'every', 'daily', 'weekly', 'cron')),
+  rule text NOT NULL,
+  generation integer NOT NULL,
+  status text NOT NULL CHECK (status IN ('active', 'inactive')),
+  desired_at text NOT NULL,
+  next_run_at text NOT NULL,
+  lease_owner text,
+  lease_until text,
+  last_request_id text,
+  last_delivery text CHECK (last_delivery IS NULL OR last_delivery IN ('accepted', 'unknown', 'rejected')),
+  attempt_count integer NOT NULL DEFAULT 0,
+  pending_occurrence text,
+  created_at text NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at text NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)`
+
 export interface CreateArgs {
   prompt: string
   title: string
@@ -62,6 +86,9 @@ export interface UpdateArgs {
   cron?: { expression: string; time_zone: string }
 }
 
+/** 计时部分；Remote 层不带 title/prompt，也要能复用同一套规则构建。 */
+export type RuleArgs = Omit<CreateArgs, 'title' | 'prompt'>
+
 interface TaskRow {
   id: string
   title: string
@@ -75,11 +102,11 @@ interface TaskRow {
 
 let ready: Promise<void> | undefined
 
-function ensure(db: ScheduleDB): Promise<void> {
+export function ensureScheduleTable(db: ScheduleDB): Promise<void> {
   if (ready !== undefined) return ready
   ready = (async () => {
     try {
-      await db.query(CREATE_TABLE)
+      await db.query(db.dialect === 'sqlite' ? CREATE_TABLE_SQLITE : CREATE_TABLE_PG)
       await db.query(CREATE_INDEX)
     } catch (error) {
       ready = undefined
@@ -90,7 +117,7 @@ function ensure(db: ScheduleDB): Promise<void> {
 }
 
 export async function createTask(db: ScheduleDB, sessionId: string, args: CreateArgs, now = new Date()): Promise<unknown> {
-  await ensure(db)
+  await ensureScheduleTable(db)
   const title = args.title.trim()
   const prompt = args.prompt.trim()
   const built = buildRule(args, now)
@@ -107,7 +134,7 @@ export async function createTask(db: ScheduleDB, sessionId: string, args: Create
 }
 
 export async function listTasks(db: ScheduleDB, sessionId: string, now = new Date()): Promise<unknown> {
-  await ensure(db)
+  await ensureScheduleTable(db)
   const rows = await db.query<TaskRow>(`
     SELECT id, title, prompt, kind, rule, generation, status, next_run_at
     FROM dsh_schedule_tasks
@@ -118,7 +145,7 @@ export async function listTasks(db: ScheduleDB, sessionId: string, now = new Dat
 }
 
 export async function deleteTask(db: ScheduleDB, sessionId: string, id: string): Promise<unknown> {
-  await ensure(db)
+  await ensureScheduleTable(db)
   const rows = await db.query<{ id: string }>(`
     UPDATE dsh_schedule_tasks
     SET status = 'inactive', generation = generation + 1,
@@ -131,7 +158,7 @@ export async function deleteTask(db: ScheduleDB, sessionId: string, id: string):
 }
 
 export async function updateTask(db: ScheduleDB, sessionId: string, args: UpdateArgs, now = new Date()): Promise<unknown> {
-  await ensure(db)
+  await ensureScheduleTable(db)
   const current = await db.query<TaskRow>(`
     SELECT id, title, prompt, kind, rule, generation, status, next_run_at
     FROM dsh_schedule_tasks
@@ -176,7 +203,7 @@ function hasTiming(args: UpdateArgs): boolean {
   return args.at !== undefined || args.every_seconds !== undefined || args.daily !== undefined || args.weekly !== undefined || args.cron !== undefined
 }
 
-function buildRule(args: CreateArgs | UpdateArgs, now: Date): { kind: string; rule: Record<string, unknown>; at: Date } {
+export function buildRule(args: CreateArgs | UpdateArgs | RuleArgs, now: Date): { kind: string; rule: Record<string, unknown>; at: Date } {
   if ('after_seconds' in args && args.after_seconds !== undefined) {
     return { kind: 'after', rule: { afterSeconds: args.after_seconds }, at: afterDelay(args.after_seconds, now) }
   }

@@ -31,6 +31,7 @@ import {
   type SandboxConfigStore,
   type SessionModelBaseUrls,
 } from './routes.ts'
+import { auditUpgradeRoutes, createSessionStream } from './session-stream.ts'
 
 /** Plugin name for loader diagnostics. */
 export const name = 'platform-api'
@@ -77,6 +78,14 @@ export interface Config {
   modelKeyHeader?: string
   /** Header carrying the platform-supplied model endpoint. Defaults to `x-dsh-model-base-url`. */
   modelBaseUrlHeader?: string
+  /** Header carrying every model the caller has configured. Defaults to `x-dsh-model-ids`. */
+  modelIdsHeader?: string
+  /**
+   * Inactivity budget for a running turn, in milliseconds. A turn with no
+   * durable event, no assistant stream and no job progress for this long is
+   * force-closed. Default 600000 (10 minutes); `0` disables the watchdog.
+   */
+  turnStallMs?: number
 }
 
 /**
@@ -169,9 +178,20 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   installJobObservability(ctx)
 
+  const gateway = createGateway(ctx, {
+    ...(config.turnStallMs === undefined ? {} : { turnStallMs: config.turnStallMs }),
+  })
+  const ownership = createOwnershipGuard(ctx)
+
+  // One SSE stream, one session. The platform relays it; browsers never reach it.
+  const sessionStream = createSessionStream(ctx, {
+    gateway,
+    ...(config.heartbeatMs === undefined ? {} : { heartbeatMs: config.heartbeatMs }),
+  })
+
   registerRoutes(ctx, {
-    gateway: createGateway(ctx),
-    ownership: createOwnershipGuard(ctx),
+    gateway,
+    ownership,
     credentials,
     headers,
     requireUser: config.requireUser ?? true,
@@ -179,11 +199,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     modelBaseUrls,
     sandboxConfig: sandboxStore,
     imageConfig: imageStore,
+    sessionStream,
     ...(config.modelKeyHeader === undefined ? {} : { modelKeyHeader: config.modelKeyHeader }),
     ...(config.modelBaseUrlHeader === undefined ? {} : { modelBaseUrlHeader: config.modelBaseUrlHeader }),
+    ...(config.modelIdsHeader === undefined ? {} : { modelIdsHeader: config.modelIdsHeader }),
     ...(config.pageSize === undefined ? {} : { pageSize: config.pageSize }),
     ...(config.heartbeatMs === undefined ? {} : { heartbeatMs: config.heartbeatMs }),
   })
+
+  // 机器闸门：脑不注册任何 Upgrade 路由。先检查此刻已挂上的，再在下一个 tick
+  // 复查一次（覆盖比本插件晚加载的插件）。违反即启动失败，不允许"某次忘了"。
+  auditUpgradeRoutes(ctx.webServer)
+  const deferredAudit = setTimeout(() => auditUpgradeRoutes(ctx.webServer), 0)
+  // 生产里 HTTP 服务一直持有事件循环，复查必然执行；测试里不必因此挂住进程。
+  deferredAudit.unref?.()
 
   ctx.logger?.info?.(
     `platform-api ready: ${credentials.length} app credential(s), routes under /brain/v1/sessions`,

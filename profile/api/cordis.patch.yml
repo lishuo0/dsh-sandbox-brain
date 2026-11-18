@@ -1,43 +1,37 @@
 # 这一份部署的插件接线。密钥来自启动时注入的环境变量，不写在这里。
 
 - insert:
-    # 客户端连接要用的浏览器会话密钥。模型密钥仍走 credentials-session，不写进这份存储。
-    - id: browser-auth-store
-      name: '@brain/dsh-browser-auth-store'
+    # 脑只对外暴露 `/brain/v1`（HTTP + 会话级 SSE）。全局 DSH Host 面
+    # （`/api` 前缀路由、`/api/remote.mux` Upgrade、各 Remote 命名空间）
+    # 全部摘除：启动审计强制 Upgrade 路由为 0，见 §3.1/§3.3。
 
-    - id: connection
-      name: '@deepseek-ai/dsh-client-connection'
-      config:
-        trustedHosts:
-          - localhost
-          - 127.0.0.1
-
-    - id: file-upload
-      name: '@deepseek-ai/dsh-client-file-upload'
-
-    - id: api-remotes
-      name: '@deepseek-ai/dsh-api-remotes'
-
+    # 工作区归平台所有；脑侧只是 `dsh_workspaces` 的投影，不碰宿主目录。
     - id: workspace
-      name: '@deepseek-ai/dsh-workspace'
+      name: '@brain/dsh-workspace-platform'
 
+    # 只提供 `sessionController` 内部服务（`/brain/v1/.../projections` 与 fork 用）。
+    # 没有 connection / api-remotes，它不会注册任何 HTTP 路由；它依赖的
+    # `typertGateway` 由下面的 typert-gateway 提供，`fileUploads` 由占位服务提供。
     - id: session-controller
       name: '@deepseek-ai/dsh-api-session-controller'
       config:
         nativeOpen: false
 
-    - id: workspace-files
-      name: '@deepseek-ai/dsh-api-workspace-files'
+    # 浏览器上传由平台收口（`P/upload`），脑收不到回执；这个占位只满足
+    # session-controller 的装配依赖，不提供任何上传路由。
+    - id: file-uploads-stub
+      name: '@brain/dsh-file-uploads-stub'
 
-    - id: workspace-controller
-      name: '@deepseek-ai/dsh-api-workspace-controller'
-      config:
-        documentsDirectory: !!js process.env.DSH_HOME ?? '/tmp'
+    # 页面直接拉文件树/预览时没有回合上下文；按请求里的会话把调用钉进沙箱作用域。
+    - id: workspace-files-session
+      name: '@brain/dsh-e2b/workspace-files'
 
     - id: database
       name: '@brain/dsh-database'
       config:
-        url: !!js process.env.DSH_DATABASE_URL
+        # 本地默认 SQLite 文件；部署时改用 url。
+        file: !!js process.env.DSH_DATABASE_FILE ?? ''
+        url: !!js process.env.DSH_DATABASE_URL ?? ''
         maxConnections: 10
 
     - id: session-persistence
@@ -56,12 +50,17 @@
         adapter: !!js process.env.SANDBOX_ADAPTER || 'e2b'
         mock:
           objectDir: !!js process.env.DSH_LOCAL_STORE || ''
+        docker:
+          image: !!js process.env.DSH_DOCKER_IMAGE || 'node:22-bookworm-slim'
+          objectDir: !!js process.env.DSH_LOCAL_STORE || ''
+          network: !!js process.env.DSH_DOCKER_NETWORK || 'none'
+          user: !!js process.env.DSH_DOCKER_USER || ''
         scope: workspace
         sandboxTimeoutMs: 3600000
         idleMs: 3600000
         sweepIntervalMs: 60000
         reclaimOrphans: false
-        volumeMountPath: "/desk/{workspaceId}"
+        volumeMountPath: "/desk"
         volumeNameTemplate: "desk-{workspaceId}"
         privateSkillDir: "/skillbox/own"
         publicSkillDir: "/skillbox/common"
@@ -69,7 +68,7 @@
           - bucketName: !!js process.env.OSS_BUCKET ?? ''
             endpoint: !!js process.env.OSS_ENDPOINT ?? ''
             bucketPath: "desks/{workspaceId}"
-            mountDir: "/desk/{workspaceId}"
+            mountDir: "/desk"
             readOnly: false
         storeKind: postgres
         directory: !!js ctx.get('sessionDirectory')
@@ -122,6 +121,13 @@
       config:
         abortGraceMs: 0
 
+    # 正文里的 `dsh-ui` 围栏由浏览器半渲染；宿主半只注册 `validate_dsh_ui` /
+    # `render_ui` 工具和内置 genui skill，不碰沙箱。
+    - id: genui
+      name: '@changfenhuang/dsh-genui'
+
+    # 平台不提供浏览器内动态插件：不挂宿主半 cordis-host-runner，也不给
+    # 输入端「创建插件」入口。会话里的 `dsh-ui` 围栏由 genui 单独渲染。
     - id: attachment-oss
       name: '@brain/dsh-attachment-oss'
       config:
@@ -141,10 +147,19 @@
     requireUser: true
     pageSize: 200
     heartbeatMs: 15000
+    # 回合看门狗：running 回合连续 10 分钟没有任何进度（持久事件 / 模型流 /
+    # 本会话后台任务输出）就强制收尾。0 关闭。
+    turnStallMs: 600000
     apps:
       - appId: !!js process.env.PLATFORM_APP_ID ?? 'platform'
         appKey: !!js process.env.PLATFORM_APP_KEY
         name: platform
+
+- id: sandbox-policy
+  config:
+    # 会话的 cwd 就是沙箱里的工作卷挂载点；没有会话的调用也按它兜底。
+    mode: workspace-write
+    workspaceRoot: /desk
 
 - id: permission
   config:
@@ -152,21 +167,22 @@
     presets:
       read-only:
         sandbox: read-only
-        approval: never
+        approval: ask
       workspace-write:
         sandbox: workspace-write
-        approval: never
+        approval: ask
       danger-full-access:
         sandbox: danger-full-access
         approval: never
 
 - id: approval
   config:
-    policy: never
+    # 收窄访问的调用要走人工确认；浏览器侧的审批面板由 client-ui-approval 提供。
+    policy: ask
 
+# session-controller 依赖 `typertGateway` 服务；本部署没有 `connection`，
+# 这个插件只提供内部服务，不会注册 `/api/remote.mux` 的 Upgrade 或任何路由。
 - id: typert-gateway
-  config:
-    websocketCompression: none
 
 - id: credentials
   disabled: true
@@ -246,7 +262,8 @@
   disabled: true
 
 - id: goal-round-driver
-  disabled: true
+  # 目标激活后由驱动自动推进轮次；之前关着，目标建出来也不会自己跑。
+  disabled: false
 
 - id: web-search-deepseek
   disabled: true

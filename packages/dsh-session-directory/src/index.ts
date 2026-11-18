@@ -12,22 +12,28 @@
 import type {} from '@brain/dsh-database'
 import { Service, type Context } from '@deepseek-ai/cordis'
 
+/** One skill or MCP server explicitly selected by a workspace. */
+export interface WorkspaceSelection {
+  readonly name: string
+  readonly scope: 'private' | 'public'
+}
+
 /** Who a session belongs to. */
 export interface SessionOwner {
   readonly userId: string
   readonly workspaceId: string
   /** Volume this workspace owns, when the platform records one. */
   readonly volumeName?: string
-  /**
-   * Workspace root inside the sandbox, when the platform records one.
-   *
-   * `dsh_workspaces.guest_root`: the platform stores where this workspace's
-   * volume is mounted, and passes the same path as the session cwd. The
-   * registry mounts the workspace prefix there, so the two can never disagree.
-   */
-  readonly guestRoot?: string
   /** Per-user skills volume name, when the platform records one. */
   readonly skillsVolume?: string
+  /**
+   * Skills the workspace explicitly selected. `undefined` means the workspace
+   * was never configured and keeps the old "all enabled skills" behaviour;
+   * an empty array means it intentionally uses none.
+   */
+  readonly skills?: readonly WorkspaceSelection[]
+  /** MCP servers the workspace explicitly selected; same tri-state rule. */
+  readonly mcpServers?: readonly WorkspaceSelection[]
 }
 
 /** User-level owner used by skills/MCP, which do not require a workspace. */
@@ -94,10 +100,10 @@ export default class SessionDirectoryService extends Service {
       user_id: string
       workspace_id: string | null
       volume_name: string | null
-      guest_root: string | null
       skills_volume: string | null
+      selection_configured: unknown
     }>(
-      `SELECT s.user_id, s.workspace_id, w.volume_name, w.guest_root, u.skills_volume
+      `SELECT s.user_id, s.workspace_id, w.volume_name, u.skills_volume, w.selection_configured
          FROM dsh_sessions s
          LEFT JOIN dsh_workspaces w ON w.id = s.workspace_id
          LEFT JOIN dsh_users u ON u.id = s.user_id
@@ -107,12 +113,17 @@ export default class SessionDirectoryService extends Service {
     const row = rows[0]
     let owner: SessionOwner | undefined
     if (row !== undefined && row.workspace_id !== null) {
+      const configured = row.selection_configured === true || row.selection_configured === 1
+      const [skills, mcpServers] = configured
+        ? await Promise.all([this.skillsOf(row.workspace_id), this.mcpServersOf(row.workspace_id)])
+        : [undefined, undefined]
       owner = {
         userId: row.user_id,
         workspaceId: row.workspace_id,
         ...(row.volume_name === null ? {} : { volumeName: row.volume_name }),
-        ...(row.guest_root === null || row.guest_root === undefined ? {} : { guestRoot: row.guest_root }),
         ...(row.skills_volume === null ? {} : { skillsVolume: row.skills_volume }),
+        ...(skills === undefined ? {} : { skills }),
+        ...(mcpServers === undefined ? {} : { mcpServers }),
       }
     }
 
@@ -124,6 +135,30 @@ export default class SessionDirectoryService extends Service {
 
     if (this.ttl > 0) this.remember(sessionId, owner)
     return owner
+  }
+
+  /** Skills explicitly selected by one workspace; empty means "none". */
+  private async skillsOf(workspaceId: string): Promise<readonly WorkspaceSelection[]> {
+    const rows = await this.ctx.db.query<{ name: string; scope: 'private' | 'public' }>(
+      `SELECT skill_name AS name, skill_scope AS scope
+         FROM dsh_workspace_skills
+        WHERE workspace_id = $1
+        ORDER BY skill_name, skill_scope`,
+      [workspaceId],
+    )
+    return rows.map((row) => ({ name: row.name, scope: row.scope }))
+  }
+
+  /** MCP servers explicitly selected by one workspace; empty means "none". */
+  private async mcpServersOf(workspaceId: string): Promise<readonly WorkspaceSelection[]> {
+    const rows = await this.ctx.db.query<{ name: string; scope: 'private' | 'public' }>(
+      `SELECT server_name AS name, server_scope AS scope
+         FROM dsh_workspace_mcp_servers
+        WHERE workspace_id = $1
+        ORDER BY server_name, server_scope`,
+      [workspaceId],
+    )
+    return rows.map((row) => ({ name: row.name, scope: row.scope }))
   }
 
   /** Lineage-aware owner lookup for subagent sessions. */

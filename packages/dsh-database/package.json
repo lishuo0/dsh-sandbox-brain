@@ -3,13 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "One PostgreSQL pool per brain process; every persistence consumer injects it.",
+  "description": "One database handle per brain process (local SQLite or PostgreSQL); every persistence consumer injects it.",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
+    },
+    "./row": {
+      "types": "./lib/row.d.ts",
+      "default": "./lib/row.js"
+    },
+    "./sqlite": {
+      "types": "./lib/sqlite.d.ts",
+      "default": "./lib/sqlite.js"
     }
   },
   "files": [

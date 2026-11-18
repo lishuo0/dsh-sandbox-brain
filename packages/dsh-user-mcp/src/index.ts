@@ -1,13 +1,16 @@
 /**
  * Per-user HTTP MCP servers.
  *
- * Reads `dsh_mcp_servers` for the session owner and reconciles one MCP client
- * per enabled `streamable-http` server on the Agent scope before every model
- * step. Changed/removed servers are disposed, new ones are mounted, so changes
- * take effect on the next turn instead of only for newly created Agents. Secrets
+ * Reads `dsh_mcp_servers` for the session owner plus rows shared as `public`
+ * and reconciles one MCP client per enabled `streamable-http` server on the
+ * Agent scope before every model step. When a member has a private server with
+ * the same name as a public one, the private row wins. Changed/removed servers
+ * are disposed, new ones are mounted, so changes take effect on the next turn
+ * instead of only for newly created Agents. Secrets
  * referenced by `cred:mcp/<server>/<header>` are decrypted from
- * `dsh_user_credentials` with AES-256-GCM. stdio is intentionally unsupported:
- * it would spawn processes on the brain host.
+ * `dsh_user_credentials` with AES-256-GCM, under the owning user of the row.
+ * stdio is intentionally unsupported: it would spawn processes on the brain
+ * host.
  *
  * @module @brain/dsh-user-mcp
  */
@@ -28,9 +31,21 @@ export interface Config {
   readonly mountTimeoutMs?: number
 }
 
+export interface WorkspaceSelection {
+  readonly name: string
+  readonly scope: 'private' | 'public'
+}
+
+interface SessionOwnerLike {
+  userId: string
+  /** undefined = 工作区没配置过，沿用全部启用；空数组 = 明确不接入任何 MCP。 */
+  mcpServers?: readonly WorkspaceSelection[]
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     sessionDirectory?: {
+      ownerOf(sessionId: string): Promise<SessionOwnerLike | undefined>
       userOf(sessionId: string): Promise<{ userId: string } | undefined>
     }
   }
@@ -38,12 +53,36 @@ declare module '@deepseek-ai/cordis' {
 
 const CRED_PREFIX = 'cred:mcp/'
 
-interface McpRow {
+export interface McpRow {
   user_id: string
   server_name: string
   transport: string
   target: string
   config: unknown
+  scope: 'private' | 'public'
+}
+
+/** 工作区明确选择时只留下选中的 server；undefined 表示沿用全部。 */
+export function filterSelected(
+  rows: readonly McpRow[],
+  selection: readonly WorkspaceSelection[] | undefined,
+): McpRow[] {
+  if (selection === undefined) return [...rows]
+  const selected = new Set(selection.map((item) => `${item.scope}:${item.name}`))
+  return rows.filter((row) => selected.has(`${row.scope}:${row.server_name}`))
+}
+
+/** 同名时私有覆盖公开；再过滤掉非 streamable-http 的行。 */
+export function chooseServers(rows: readonly McpRow[]): McpRow[] {
+  const chosen = new Map<string, McpRow>()
+  for (const row of rows) {
+    if (row.transport !== 'streamable-http') continue
+    const current = chosen.get(row.server_name)
+    if (current === undefined || (current.scope !== 'private' && row.scope === 'private')) {
+      chosen.set(row.server_name, row)
+    }
+  }
+  return [...chosen.values()].sort((left, right) => left.server_name.localeCompare(right.server_name))
 }
 
 interface McpConfig {
@@ -55,7 +94,22 @@ type AgentLike = { session: { id: string }; ctx: Context }
 
 interface MountedServer {
   readonly hash: string
-  readonly dispose: () => void
+  /** Cordis 的组件卸载是异步的；停用/换配置要等卸载完，工具才不会残留到下一步。 */
+  readonly dispose: () => Promise<void>
+}
+
+/** `ctx.plugin()` 返回的 Fiber 里卸载相关的字段（类型包没有导出 Fiber 的完整形状）。 */
+interface LoadedFiber {
+  dispose?: () => unknown
+  /** 卸载收尾的 Promise；dispose() 本身先返回，效果清理挂在它后面。 */
+  inertia?: Promise<unknown>
+}
+
+/** 等 Fiber 连效果清理一起卸载完，工具注册才会真正撤销。 */
+async function disposeFiber(fiber: LoadedFiber | undefined): Promise<void> {
+  if (fiber === undefined) return
+  await Promise.resolve(fiber.dispose?.())
+  for (let inertia = fiber.inertia; inertia !== undefined; inertia = fiber.inertia) await inertia
 }
 
 export default class UserMcpPlugin {
@@ -82,20 +136,25 @@ export default class UserMcpPlugin {
   /** Bring the Agent's mounted MCP clients in line with the platform rows. */
   private async reconcile(ctx: Context, agent: AgentLike): Promise<void> {
     const directory = ctx.get('sessionDirectory') as
-      | { userOf(sessionId: string): Promise<{ userId: string } | undefined> }
+      | {
+          ownerOf(sessionId: string): Promise<SessionOwnerLike | undefined>
+          userOf(sessionId: string): Promise<{ userId: string } | undefined>
+        }
       | undefined
-    const user = await directory?.userOf(agent.session.id)
+    // ownerOf 带工作区选择；没有工作区（老会话）时退回 userOf，沿用全部启用。
+    const owner = await directory?.ownerOf(agent.session.id)
+    const user = owner ?? await directory?.userOf(agent.session.id)
     if (user === undefined) return
     const rows = await ctx.db.query<McpRow>(
-      `SELECT user_id, server_name, transport, target, config
+      `SELECT user_id, server_name, transport, target, config, scope
          FROM dsh_mcp_servers
-        WHERE user_id = $1 AND enabled = true
+        WHERE enabled = true AND (user_id = $1 OR scope = 'public')
         ORDER BY server_name`,
       [user.userId],
     )
+    const selection = 'mcpServers' in user ? (user.mcpServers as readonly WorkspaceSelection[] | undefined) : undefined
     const desired = new Map<string, { row: McpRow; hash: string }>()
-    for (const row of rows) {
-      if (row.transport !== 'streamable-http') continue
+    for (const row of chooseServers(filterSelected(rows, selection))) {
       desired.set(row.server_name, { row, hash: configHash(row) })
     }
     let current = this.mounted.get(agent)
@@ -106,8 +165,12 @@ export default class UserMcpPlugin {
     for (const [name, mounted] of [...current.entries()]) {
       const next = desired.get(name)
       if (next === undefined || next.hash !== mounted.hash) {
-        mounted.dispose()
         current.delete(name)
+        try {
+          await mounted.dispose()
+        } catch (error) {
+          ctx.logger?.warn?.(`user-mcp: dispose ${name} failed: ${String(error)}`)
+        }
       }
     }
     for (const [name, desiredServer] of desired) {
@@ -135,10 +198,10 @@ export default class UserMcpPlugin {
       const timer = setTimeout(() => resolve('timeout'), this.mountTimeout)
       timer.unref?.()
     })
-    let fiber: { dispose?: () => unknown } | undefined
+    let fiber: LoadedFiber | undefined
     try {
       fiber = (agent.ctx as unknown as {
-        plugin(plugin: unknown, config: unknown): { dispose?: () => unknown } & PromiseLike<unknown>
+        plugin(plugin: unknown, config: unknown): LoadedFiber & PromiseLike<unknown>
       }).plugin(McpClient, {
         transport: 'streamable-http',
         serverName: row.server_name,
@@ -150,23 +213,17 @@ export default class UserMcpPlugin {
       const outcome = await Promise.race([Promise.resolve(fiber).then(() => 'mounted' as const), timeout])
       if (outcome === 'timeout') {
         ctx.logger?.warn?.(`user-mcp: ${row.server_name} did not connect within ${this.mountTimeout}ms`)
-        fiber?.dispose?.()
+        await disposeFiber(fiber).catch(() => undefined)
         return undefined
       }
     } catch (error) {
       ctx.logger?.warn?.(`user-mcp: mount ${row.server_name} failed: ${String(error)}`)
-      fiber?.dispose?.()
+      await disposeFiber(fiber).catch(() => undefined)
       return undefined
     }
     return {
       hash,
-      dispose: () => {
-        try {
-          fiber?.dispose?.()
-        } catch (error) {
-          ctx.logger?.warn?.(`user-mcp: dispose ${row.server_name} failed: ${String(error)}`)
-        }
-      },
+      dispose: () => disposeFiber(fiber),
     }
   }
 
@@ -206,7 +263,13 @@ export default class UserMcpPlugin {
 }
 
 function configHash(row: McpRow): string {
-  return JSON.stringify({ user_id: row.user_id, transport: row.transport, target: row.target, config: row.config })
+  return JSON.stringify({
+    user_id: row.user_id,
+    scope: row.scope,
+    transport: row.transport,
+    target: row.target,
+    config: row.config,
+  })
 }
 
 function parseConfig(value: unknown): McpConfig {

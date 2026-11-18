@@ -14,21 +14,39 @@
  * @module @brain/dsh-platform-api/routes
  */
 
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { AuthError, authenticate, type AppCredential, type AuthHeaders, type AuthenticatedCaller } from './auth.ts'
 import { HttpError, SseWriter, handle, query, readJson, segmentsAfter, sendError, sendJson } from './http.ts'
+import { normalizeOutcome, type SessionStream } from './session-stream.ts'
 import type { SessionModelKeys } from '@brain/dsh-credentials-session'
 import { handleWorkspaceFiles } from './workspace-files.ts'
 
 /** Prefix every route lives under. */
 export const PREFIX = '/brain/v1/sessions'
 
+/** 定时任务的 Remote 转发入口。 */
+const SCHEDULE_PREFIX = '/brain/v1/schedule'
+
 /** One frame on the live stream. */
 export type StreamFrame =
-  /** A committed event: durable, replayable, identical to what the log holds. */
-  | { readonly kind: 'event'; readonly seq: number; readonly type: string; readonly data: unknown }
+  /**
+   * A committed event: durable, replayable, identical to what the log holds.
+   *
+   * `surfaceOp`/`sourceEventSeqs` ride along because the browser rebuilds its
+   * ordered surface from these frames; dropping them makes upstream's session
+   * store reject surface-eligible events ("requires a surfaceOp marker").
+   */
+  | {
+      readonly kind: 'event'
+      readonly seq: number
+      readonly type: string
+      readonly data: unknown
+      readonly surfaceOp?: unknown
+      readonly sourceEventSeqs?: unknown
+      readonly ignorable?: boolean
+    }
   /** An assistant streaming chunk: process-local, never stored, arrives during a step. */
   | { readonly kind: 'assistant'; readonly frame: unknown }
   /** Driver status for this session: running / idle / … */
@@ -58,12 +76,26 @@ export type JobFollowFrame =
 export interface BrainGateway {
   /** Create or adopt a session and return its id. */
   create(input: { cwd: string; preset?: string; sessionId?: string }): Promise<{ sessionId: string }>
-  /** Submit one user message. */
-  prompt(sessionId: string, text: string, requestId: string): Promise<void>
+  /**
+   * Submit one user message.
+   *
+   * `mode: 'queue'` (the default) starts or queues a turn; `mode: 'steer'`
+   * folds the text into the turn that is currently running, at its next step
+   * boundary. They are different operations, not two spellings of one.
+   */
+  prompt(sessionId: string, text: string, requestId: string, mode?: 'queue' | 'steer'): Promise<void>
+  /** Fork one session's committed log into a new session; the log lives here. */
+  fork?(sessionId: string, request: { atSeq?: number }): Promise<{ sessionId: string }>
   /** Interrupt the active turn. */
   cancel(sessionId: string): Promise<void>
-  /** Last committed seq for one session; -1 when the log is empty. */
-  head(sessionId: string): Promise<{ cursor: number }>
+  /**
+   * Current durable offset and driver state for one session.
+   *
+   * `cursor` is the last committed seq (-1 when the log is empty); `running`
+   * is the live Agent status, so a client that attaches learns the initial
+   * state instead of waiting for the next transition.
+   */
+  head(sessionId: string): Promise<{ cursor: number; running: boolean }>
   /** Read committed events with `seq` greater than `after`. */
   events(sessionId: string, after: number, limit: number): Promise<Array<{ seq: number; type: string; data: unknown }>>
   /**
@@ -73,6 +105,8 @@ export interface BrainGateway {
   subscribe(sessionId: string, listener: (frame: StreamFrame) => void): () => void
   /** Provider-grouped catalog plus the deployment default model. */
   models?(): Promise<unknown>
+  /** Make these model ids selectable on one provider (the platform names them per user). */
+  registerModels?(provider: string, models: readonly string[]): Promise<void>
   /** Install one Session-local model selection and return the normalized value. */
   selectModel?(sessionId: string, selection: {
     readonly provider: string
@@ -82,7 +116,7 @@ export interface BrainGateway {
   /** Effective slash-command descriptors for one live Session. */
   commands?(sessionId: string): Promise<unknown>
   /** Execute one slash-command line without sending it to the model. */
-  executeCommand?(sessionId: string, line: string): Promise<unknown>
+  executeCommand?(sessionId: string, line: string, attachments?: readonly unknown[]): Promise<unknown>
   /** Current goal for one live Session. */
   goal?(sessionId: string): Promise<unknown>
   /** Whole-value goal edit (objective and/or round cap). */
@@ -97,6 +131,14 @@ export interface BrainGateway {
   selectPreset?(sessionId: string, agentPreset: string): Promise<unknown>
   /** Process permission-preset catalog. */
   permissionCatalog?(): Promise<unknown>
+  /**
+   * Invoke one Typert Remote namespace in-process.
+   *
+   * Only the `schedule` namespace travels this way: the platform scopes its
+   * arguments to the member's Sessions, then forwards the call. The brain never
+   * exposes `/api/*` to the network; this stays behind `/brain/v1`.
+   */
+  remote?(namespace: string, method: string, args: Record<string, unknown>): Promise<unknown>
   /** Current projection baseline (or cached hints) for one Session. */
   projections?(sessionId: string): Promise<unknown>
   /** Current per-message feedback items for one Session. */
@@ -125,18 +167,18 @@ export interface SessionModelBaseUrls {
   latest(): string | undefined
 }
 
-/** E2B runtime configuration supplied by the platform. */
+/** E2B / OSS runtime configuration supplied by the platform. Groups are independent. */
 export interface SandboxConfig {
-  readonly apiKey: string
-  readonly apiUrl: string
-  readonly domain: string
-  readonly template: string
-  readonly roleArn: string
-  readonly ossBucket: string
-  readonly ossEndpoint: string
-  readonly ossRegion: string
-  readonly ossAccessKeyId: string
-  readonly ossAccessKeySecret: string
+  readonly apiKey?: string
+  readonly apiUrl?: string
+  readonly domain?: string
+  readonly template?: string
+  readonly roleArn?: string
+  readonly ossBucket?: string
+  readonly ossEndpoint?: string
+  readonly ossRegion?: string
+  readonly ossAccessKeyId?: string
+  readonly ossAccessKeySecret?: string
 }
 
 /** Platform-supplied image generation settings. */
@@ -173,29 +215,47 @@ function modelBaseUrlOf(value: string | undefined): string | undefined {
   return trimmed.replace(/\/+$/u, '')
 }
 
-/** Read the complete E2B runtime configuration from one create request. */
-function sandboxConfigOf(
+/**
+ * Read the platform-supplied runtime configuration from one create request.
+ *
+ * E2B and attachment OSS are independent: a Docker/mock deployment can use OSS
+ * for attachments without supplying any E2B value. Fill only the groups whose
+ * fields all arrived, so a partial group never shadows the brain's own config.
+ */
+export function sandboxConfigOf(
   headers: Record<string, string | string[] | undefined>,
 ): SandboxConfig | undefined {
   const value = (name: string): string => {
     const raw = headers[name]
     return (Array.isArray(raw) ? raw[0] : raw)?.trim() ?? ''
   }
-  const config = {
-    apiKey: value('x-dsh-e2b-api-key'),
-    apiUrl: value('x-dsh-e2b-api-url'),
-    domain: value('x-dsh-e2b-domain'),
-    template: value('x-dsh-e2b-template'),
-    roleArn: value('x-dsh-e2b-role-arn'),
-    ossBucket: value('x-dsh-oss-bucket'),
-    ossEndpoint: value('x-dsh-oss-endpoint'),
-    ossRegion: value('x-dsh-oss-region'),
-    ossAccessKeyId: value('x-dsh-oss-access-key-id'),
-    ossAccessKeySecret: value('x-dsh-oss-access-key-secret'),
+  const config: SandboxConfig = {}
+  const apiKey = value('x-dsh-e2b-api-key')
+  const apiUrl = value('x-dsh-e2b-api-url')
+  const template = value('x-dsh-e2b-template')
+  if (apiKey !== '' && apiUrl !== '' && template !== '') {
+    Object.assign(config, {
+      apiKey,
+      apiUrl,
+      domain: value('x-dsh-e2b-domain'),
+      template,
+      roleArn: value('x-dsh-e2b-role-arn'),
+    })
   }
-  return config.apiKey === '' || config.apiUrl === '' || config.template === ''
-    ? undefined
-    : config
+  const ossBucket = value('x-dsh-oss-bucket')
+  const ossEndpoint = value('x-dsh-oss-endpoint')
+  const ossAccessKeyId = value('x-dsh-oss-access-key-id')
+  const ossAccessKeySecret = value('x-dsh-oss-access-key-secret')
+  if (ossBucket !== '' && ossEndpoint !== '' && ossAccessKeyId !== '' && ossAccessKeySecret !== '') {
+    Object.assign(config, {
+      ossBucket,
+      ossEndpoint,
+      ossRegion: value('x-dsh-oss-region'),
+      ossAccessKeyId,
+      ossAccessKeySecret,
+    })
+  }
+  return Object.keys(config).length === 0 ? undefined : config
 }
 
 /** Read image generation settings from one create request. */
@@ -238,10 +298,14 @@ export interface RouteConfig {
   readonly modelBaseUrls?: SessionModelBaseUrls
   /** Header carrying the platform-supplied model endpoint. Defaults to `x-dsh-model-base-url`. */
   readonly modelBaseUrlHeader?: string
+  /** Header carrying every model the user has configured. Defaults to `x-dsh-model-ids`. */
+  readonly modelIdsHeader?: string
   /** Sandbox runtime configuration store; absent when the platform does not manage E2B. */
   readonly sandboxConfig?: SandboxConfigStore
   /** Image generation configuration store; absent when image generation is not enabled. */
   readonly imageConfig?: ImageConfigStore
+  /** 会话实时面；未装配时 `stream` / `answers` 回 501。 */
+  readonly sessionStream?: SessionStream
 }
 
 /**
@@ -254,6 +318,7 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
   const heartbeatMs = config.heartbeatMs ?? 15_000
   const modelKeyHeader = (config.modelKeyHeader ?? 'x-dsh-model-key').toLowerCase()
   const modelBaseUrlHeader = (config.modelBaseUrlHeader ?? 'x-dsh-model-base-url').toLowerCase()
+  const modelIdsHeader = (config.modelIdsHeader ?? 'x-dsh-model-ids').toLowerCase()
 
   /** Authenticate one request, or answer 401 and return undefined. */
   const caller = (req: IncomingMessage, res: ServerResponse): AuthenticatedCaller | undefined => {
@@ -280,13 +345,28 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
     ctx.logger?.warn?.(`platform-api: request failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 
-  // 平台在登录后把这个启动令牌交给浏览器，用来换客户端的会话 cookie。
+  /**
+   * Re-assert the member's model ids on the process-wide provider catalog.
+   *
+   * Registration lives in the provider's live config, not in the database, so
+   * it disappears when the brain restarts. Every platform call is an
+   * opportunity to restore it; the operation is idempotent.
+   */
+  const registerModelsFromHeaders = async (headers: IncomingHttpHeaders): Promise<void> => {
+    if (config.gateway.registerModels === undefined) return
+    const raw = headers[modelIdsHeader]
+    const value = Array.isArray(raw) ? raw[0] : raw
+    const models = (value ?? '').split(',').map(id => id.trim()).filter(id => id !== '')
+    if (models.length > 0) await config.gateway.registerModels('user', models)
+  }
+
+  // 平台改了 `dsh_workspaces` 之后，让脑重新投影工作区。租户由平台判定，这里只认应用凭据。
   ctx.webServer.register({
     kind: 'exact',
-    path: '/brain/v1/client-token',
+    path: '/brain/v1/workspaces/sync',
     handler: (req, res) => void handle(req, res, async () => {
-      if (req.method !== 'GET') {
-        sendError(res, 405, 'method-not-allowed', 'use GET')
+      if (req.method !== 'POST') {
+        sendError(res, 405, 'method-not-allowed', 'use POST')
         return
       }
       try {
@@ -301,18 +381,9 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
         }
         throw error
       }
-      let connection: { browserAuth?: { launchToken?: string } } | undefined
-      try {
-        connection = ctx.get('connection') as { browserAuth?: { launchToken?: string } } | undefined
-      } catch {
-        connection = undefined
-      }
-      const token = connection?.browserAuth?.launchToken
-      if (!token) {
-        sendError(res, 404, 'client-token-unavailable', 'connection is not mounted')
-        return
-      }
-      sendJson(res, 200, { token })
+      const registry = ctx.get('workspaceRegistry') as unknown as { refresh?: () => Promise<void> } | undefined
+      await registry?.refresh?.()
+      sendJson(res, 200, { ok: true })
     }, diagnose),
   })
 
@@ -409,6 +480,7 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
       if (modelBaseUrl !== undefined) config.modelBaseUrls?.set(created.sessionId, modelBaseUrl)
       if (sandbox !== undefined) config.sandboxConfig?.set(sandbox)
       if (image !== undefined) config.imageConfig?.set(image)
+      await registerModelsFromHeaders(req.headers)
       const modelId = headerValue(req.headers['x-dsh-model-id'])
       if (modelId !== undefined && config.gateway.selectModel !== undefined) {
         await config.gateway.selectModel(created.sessionId, { provider: 'user', model: modelId })
@@ -444,6 +516,59 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
     exact('/brain/v1/permission-presets', 'GET', async () => config.gateway.permissionCatalog?.())
   }
 
+  // POST /brain/v1/schedule/{action}
+  //
+  // 定时任务是唯一一个只有 Typert Remote 形态的命名空间（`@brain/dsh-schedule-tasks`）；
+  // 平台补好成员会话范围后从这里转发。脑不暴露 `/api/*`，这是唯一入口，凭据与其它
+  // `/brain/v1` 路由相同。回包保持 Remote 信封，平台按 `result.ok` 分流。
+  ctx.webServer.register({
+    kind: 'prefix',
+    path: SCHEDULE_PREFIX,
+    handler: (req, res) => void handle(req, res, async () => {
+      if (req.method !== 'POST') {
+        sendError(res, 405, 'method-not-allowed', 'use POST')
+        return
+      }
+      const who = caller(req, res)
+      if (who === undefined) return
+      const parts = segmentsAfter(req.url ?? '/', SCHEDULE_PREFIX)
+      if (parts.length !== 1 || parts[0] === undefined || parts[0] === '') {
+        sendError(res, 404, 'not-found', 'unknown schedule action')
+        return
+      }
+      const body = asObject(await readJson(req))
+      const payload = body?.payload !== undefined && typeof body.payload === 'object' && body.payload !== null
+        ? body.payload as Record<string, unknown>
+        : undefined
+      const args = payload?.args !== undefined && typeof payload.args === 'object' && payload.args !== null
+        ? payload.args as Record<string, unknown>
+        : {}
+      const rpcId = optionalString(body?.rpcId) ?? ''
+      const invoke = config.gateway.remote
+      if (invoke === undefined) {
+        sendError(res, 501, 'not-supported', 'the remote gateway is not composed')
+        return
+      }
+      try {
+        const value = await invoke('schedule', parts[0], args)
+        sendJson(res, 200, { type: 'server-response', rpcId, result: { ok: true, value } })
+      } catch (error) {
+        const code = (error as { code?: unknown }).code
+        sendJson(res, 200, {
+          type: 'server-response',
+          rpcId,
+          result: {
+            ok: false,
+            error: {
+              code: typeof code === 'string' && code !== '' ? code : 'schedule/input-invalid',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          },
+        })
+      }
+    }, diagnose),
+  })
+
   // Everything under /brain/v1/sessions/{id}/…
   ctx.webServer.register({
     kind: 'prefix',
@@ -459,6 +584,11 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
       const [sessionId, action, subaction, verb] = parts as [string, string, string | undefined, string | undefined]
       const who = caller(req, res)
       if (who === undefined) return
+      // Model registration is process-wide and idempotent, so every platform
+      // call may re-assert it. A command (compaction) or a model selection
+      // resolves the model through the provider catalog without a platform
+      // round-trip of its own, and the registration is lost on brain restart.
+      await registerModelsFromHeaders(req.headers)
       // Ownership first: every action below touches someone's session.
       if (config.ownership !== undefined && who.userId !== undefined) {
         await config.ownership.assert(sessionId, who.userId)
@@ -475,8 +605,34 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
           if (text === undefined || text.trim() === '') {
             throw new HttpError(400, 'invalid-text', 'text is required')
           }
-          await config.gateway.prompt(sessionId, text, who.requestId)
+          const mode = optionalString(body.mode)
+          if (mode !== undefined && mode !== 'queue' && mode !== 'steer') {
+            throw new HttpError(400, 'invalid-mode', "mode must be 'queue' or 'steer'")
+          }
+          await config.gateway.prompt(sessionId, text, who.requestId, mode as 'queue' | 'steer' | undefined)
           sendJson(res, 202, { accepted: true, requestId: who.requestId })
+          return
+        }
+
+        case 'fork': {
+          if (req.method !== 'POST') {
+            sendError(res, 405, 'method-not-allowed', 'use POST')
+            return
+          }
+          if (config.gateway.fork === undefined) {
+            sendError(res, 501, 'not-supported', 'fork is not available on this deployment')
+            return
+          }
+          const body = asObject(await readJson(req))
+          const atSeq = body.atSeq
+          if (atSeq !== undefined && (typeof atSeq !== 'number' || !Number.isSafeInteger(atSeq) || atSeq < 0)) {
+            throw new HttpError(400, 'invalid-at-seq', 'atSeq must be a non-negative integer')
+          }
+          const forked = await config.gateway.fork(
+            sessionId,
+            atSeq === undefined ? {} : { atSeq: atSeq as number },
+          )
+          sendJson(res, 201, { sessionId: forked.sessionId, requestId: who.requestId })
           return
         }
 
@@ -579,7 +735,10 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
           if (line === undefined || line.trim() === '') {
             throw new HttpError(400, 'invalid-line', 'line is required')
           }
-          sendJson(res, 200, { result: await config.gateway.executeCommand(sessionId, line) })
+          const attachments = Array.isArray(body.attachments) ? body.attachments : undefined
+          sendJson(res, 200, {
+            result: await config.gateway.executeCommand(sessionId, line, attachments),
+          })
           return
         }
 
@@ -745,7 +904,14 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
             if (sse === undefined) return
             switch (frame.kind) {
               case 'event':
-                sse.send('event', { seq: frame.seq, type: frame.type, data: frame.data })
+                sse.send('event', {
+                  seq: frame.seq,
+                  type: frame.type,
+                  data: frame.data,
+                  ...(frame.surfaceOp === undefined ? {} : { surfaceOp: frame.surfaceOp }),
+                  ...(frame.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: frame.sourceEventSeqs }),
+                  ...(frame.ignorable === true ? { ignorable: true } : {}),
+                })
                 return
               case 'assistant':
                 sse.send('assistant', frame.frame)
@@ -800,6 +966,48 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
           }
           req.on('close', finish)
           res.on('close', finish)
+          return
+        }
+
+        case 'stream': {
+          if (req.method !== 'GET') {
+            sendError(res, 405, 'method-not-allowed', 'use GET')
+            return
+          }
+          if (config.sessionStream === undefined) {
+            sendError(res, 501, 'not-supported', 'the session stream is not composed on this replica')
+            return
+          }
+          // Resolve the durable offset before any response bytes exist: an
+          // unknown session must stay the documented 404, not an empty 200.
+          const head = await config.gateway.head(sessionId)
+          config.sessionStream.attach(sessionId, req, res, head.cursor, head.running)
+          return
+        }
+
+        case 'answers': {
+          if (req.method !== 'POST') {
+            sendError(res, 405, 'method-not-allowed', 'use POST')
+            return
+          }
+          if (config.sessionStream === undefined) {
+            sendError(res, 501, 'not-supported', 'the session stream is not composed on this replica')
+            return
+          }
+          const body = asObject(await readJson(req))
+          const requestId = optionalString(body.requestId)
+          const outcome = normalizeOutcome(body.outcome)
+          if (requestId === undefined) {
+            throw new HttpError(400, 'invalid-answer', 'requestId is required')
+          }
+          if (outcome === undefined) {
+            throw new HttpError(400, 'invalid-answer', 'outcome must be {"kind":"result"|"rejected"}')
+          }
+          if (!config.sessionStream.answer(sessionId, requestId, outcome)) {
+            // 已答复、已撤销或不属于本会话：不暴露是哪种。
+            throw new HttpError(409, 'session/mismatch', 'no pending request with this id on this session')
+          }
+          sendJson(res, 200, { accepted: true })
           return
         }
 

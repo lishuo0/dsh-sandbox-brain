@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { asJson } from '@brain/dsh-database/row'
 import type {} from '@brain/dsh-database'
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -79,7 +80,7 @@ export interface Config {
 }
 
 /** Where a stored record lives, used in refusal diagnostics. */
-const LOCATION = { kind: 'postgres', path: 'dsh_session_events' } as const
+const LOCATION = { kind: 'database', path: 'dsh_session_events' } as const
 
 /**
  * Whether an append may proceed under the lease this handle claimed.
@@ -219,11 +220,12 @@ export default class PgSessionPersistence extends SessionPersistence {
     )
     const row = rows[0]
     if (row === undefined) throw new SessionPersistenceNotFoundError(id)
+    const header = asJson<SessionHeader>(row.header)
     const inheritedEventCount = Number(row.inherited_count)
     const cursor = Number(row.next_seq)
 
     if (access === 'read') {
-      return this.adopt(new PgHandle(this, id, row.header, 'read', { cursor, inheritedEventCount, generation: 0 }))
+      return this.adopt(new PgHandle(this, id, header, 'read', { cursor, inheritedEventCount, generation: 0 }))
     }
 
     const generation = await this.ctx.db.transaction(async run => {
@@ -233,7 +235,7 @@ export default class PgSessionPersistence extends SessionPersistence {
       throw error
     })
 
-    return this.adopt(new PgHandle(this, id, row.header, 'write', { cursor, inheritedEventCount, generation }))
+    return this.adopt(new PgHandle(this, id, header, 'write', { cursor, inheritedEventCount, generation }))
   }
 
   /**
@@ -320,10 +322,11 @@ export default class PgSessionPersistence extends SessionPersistence {
     )
     const row = rows[0]
     if (row === undefined) return undefined
+    const header = asJson<SessionHeader>(row.header)
     const cursor = Number(row.next_seq)
-    const events = cursor === 0 ? [] : await this.readEvents(key, row.header, 0, cursor)
+    const events = cursor === 0 ? [] : await this.readEvents(key, header, 0, cursor)
     return {
-      header: row.header,
+      header,
       inheritedEventCount: Number(row.inherited_count),
       cursor,
       closers: interruptedTurnClosers(events),
@@ -351,8 +354,8 @@ export default class PgSessionPersistence extends SessionPersistence {
     const row = rows[0]
     if (row === undefined) return undefined
     return {
-      header: row.header,
-      revision: SessionPersistenceRevision(`postgres:${String(id)}:${row.revision}`),
+      header: asJson<SessionHeader>(row.header),
+      revision: SessionPersistenceRevision(`${this.ctx.db.dialect}:${String(id)}:${row.revision}`),
       eventCount: Number(row.next_seq),
     }
   }
@@ -362,8 +365,8 @@ export default class PgSessionPersistence extends SessionPersistence {
       'SELECT session_id, header, next_seq, revision FROM dsh_session_headers',
     )
     return rows.map(row => ({
-      header: row.header,
-      revision: SessionPersistenceRevision(`postgres:${row.session_id}:${row.revision}`),
+      header: asJson<SessionHeader>(row.header),
+      revision: SessionPersistenceRevision(`${this.ctx.db.dialect}:${row.session_id}:${row.revision}`),
       eventCount: Number(row.next_seq),
     }))
   }
@@ -397,7 +400,7 @@ export default class PgSessionPersistence extends SessionPersistence {
         LIMIT $3`,
       [id, from, count],
     )
-    return validateStoredEvents(header, rows.map(row => row.event), LOCATION) as SessionEvent[]
+    return validateStoredEvents(header, rows.map(row => asJson<SessionEvent>(row.event)), LOCATION) as SessionEvent[]
   }
 
   /**
@@ -465,14 +468,14 @@ export default class PgSessionPersistence extends SessionPersistence {
   ): Promise<number> {
     const claimed = await run<{ generation: string }>(
       `INSERT INTO dsh_session_leases (session_id, owner, generation, expires_at)
-       VALUES ($1, $2, 1, now() + ($3 || ' milliseconds')::interval)
+       VALUES ($1, $2, 1, $3)
        ON CONFLICT (session_id) DO UPDATE
          SET owner = EXCLUDED.owner,
              generation = dsh_session_leases.generation + 1,
              expires_at = EXCLUDED.expires_at
        WHERE dsh_session_leases.expires_at < now()
        RETURNING generation`,
-      [id, this.instanceId, String(this.leaseMs)],
+      [id, this.instanceId, this.expiry()],
     )
     if (claimed.length === 0) throw new SessionAlreadyOwnedError(id as never)
     return Number(claimed[0]?.generation ?? 1)
@@ -491,27 +494,33 @@ export default class PgSessionPersistence extends SessionPersistence {
   ): Promise<number> {
     const claimed = await run<{ generation: string }>(
       `INSERT INTO dsh_session_leases (session_id, owner, generation, expires_at)
-       VALUES ($1, $2, 1, now() + ($3 || ' milliseconds')::interval)
+       VALUES ($1, $2, 1, $3)
        ON CONFLICT (session_id) DO UPDATE
          SET owner = EXCLUDED.owner,
              generation = dsh_session_leases.generation + 1,
              expires_at = EXCLUDED.expires_at
        RETURNING generation`,
-      [id, this.instanceId, String(this.leaseMs)],
+      [id, this.instanceId, this.expiry()],
     )
     return Number(claimed[0]?.generation ?? 1)
+  }
+
+  /** Lease expiry as an ISO timestamp, so both dialects take the same parameter. */
+  private expiry(): string {
+    return new Date(Date.now() + this.leaseMs).toISOString()
   }
 
   /** Renew every lease this process holds. */
   private async renewLeases(): Promise<void> {
     const ids = [...this.writers.keys()]
     if (ids.length === 0) return
+    const placeholders = ids.map((_, index) => `$${index + 3}`).join(', ')
     const renewed = await this.ctx.db.query<{ session_id: string }>(
       `UPDATE dsh_session_leases
-          SET expires_at = now() + ($3 || ' milliseconds')::interval
-        WHERE session_id = ANY($1::text[]) AND owner = $2
+          SET expires_at = $1
+        WHERE session_id IN (${placeholders}) AND owner = $2
         RETURNING session_id`,
-      [ids, this.instanceId, String(this.leaseMs)],
+      [this.expiry(), this.instanceId, ...ids],
     )
     const kept = new Set(renewed.map(row => row.session_id))
     for (const id of lostLeaseIds(ids, kept)) {
@@ -672,9 +681,11 @@ function stateOf(handle: PgHandle): HandleState {
   return (handle as unknown as { state: HandleState }).state
 }
 
-/** PostgreSQL unique-violation code. */
+/** PostgreSQL 23505 / SQLite errcode 2067·1555. */
 function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '23505'
+  if (typeof error !== 'object' || error === null) return false
+  const { code, errcode } = error as { code?: unknown; errcode?: unknown }
+  return code === '23505' || errcode === 2067 || errcode === 1555
 }
 
 /** Retries after a force close loses a write race with the fenced-out writer. */

@@ -13,6 +13,8 @@ import { dropEmpty, id, volumeNameFor, type SandboxKey } from './keys.ts'
 import { E2bPlatform, type E2bConfig } from './e2b-adapter.ts'
 import { PgBindingStore } from './store-pg.ts'
 import { MockPlatform, type MockConfig } from './mock-adapter.ts'
+import { DockerPlatform, type DockerConfig } from './docker-adapter.ts'
+import { sandboxSessionId } from './session-scope.ts'
 import {
   SandboxPlatformError,
   type SandboxClient,
@@ -61,14 +63,6 @@ export interface SessionOwner {
    * {@link Config.volumeNameTemplate}.
    */
   readonly volumeName?: string
-  /**
-   * Workspace root inside the sandbox, as recorded by the platform.
-   *
-   * `dsh_workspaces.guest_root`. The platform uses the same value as the
-   * session cwd, so it wins over {@link Config.volumeMountPath}: mounting
-   * anywhere else would leave the cwd pointing at an empty directory.
-   */
-  readonly guestRoot?: string
   /** Per-user skills volume, kept for older deployments. */
   readonly skillsVolume?: string
 }
@@ -208,12 +202,17 @@ export class MemoryBindingStore implements BindingStore {
 export interface Config {
   /** Which level owns a sandbox. */
   readonly scope: SandboxScope
-  /** Platform adapter. `mock` runs sandboxes as local directories, for laptop debugging. */
-  readonly adapter: 'e2b' | 'mock' | 'box'
+  /**
+   * Platform adapter. `mock` runs sandboxes as local directories on the host;
+   * `docker` runs one container per workspace for an isolated local test.
+   */
+  readonly adapter: 'e2b' | 'mock' | 'docker' | 'box'
   /** E2B credentials and template. Required when `adapter` is `e2b`. */
   readonly e2b?: E2bConfig
   /** Mock adapter settings, used when `adapter` is `mock`. */
   readonly mock?: MockConfig
+  /** Docker adapter settings, used when `adapter` is `docker`. */
+  readonly docker?: DockerConfig
   /**
    * Injected platform implementation.
    *
@@ -257,12 +256,13 @@ export interface Config {
   readonly labels?: Readonly<Record<string, string>>
   /**
    * Mount path for the per-sandbox volume, and the workspace root reported to
-   * tools. Defaults to `/desk/{workspaceId}`. Supports `{workspaceId}`,
-   * `{userId}` and `{sessionId}`, rendered per sandbox; when `ossMounts` is set,
-   * the workspace entry's `mountDir` must use the same template.
+   * tools. Defaults to `/desk`. Supports `{workspaceId}`, `{userId}` and
+   * `{sessionId}`, rendered per sandbox; when `ossMounts` is set, the workspace
+   * entry's `mountDir` must use the same template.
    *
-   * This is the fallback only: `workspaces.guest_root` from the session owner
-   * takes precedence, so the mount matches the cwd the platform hands sessions.
+   * A workspace owns its own sandbox and volume, so the mount point does not
+   * need to be per-workspace: every sandbox can use the same path. The platform
+   * passes this value as the session cwd.
    */
   readonly volumeMountPath?: string
   /**
@@ -277,12 +277,13 @@ export interface Config {
    */
   readonly volumeNameTemplate?: string
   /**
-   * Temporary fixed volume name for every sandbox.
+   * Legacy fallback volume name for sandboxes whose workspace row carries no
+   * `workspaces.volume_name`.
    *
-   * When set, `workspaces.volume_name` and `volumeNameTemplate` are ignored and
-   * every workspace mounts this one volume, so workspace file isolation is
-   * gone. Use only until volume provisioning exists; remove it when the
-   * platform can create one volume per workspace.
+   * A workspace row's own volume always wins; this value only covers old
+   * schemas that never recorded one. Prefer {@link volumeNameTemplate}, and do
+   * not set it in a multi-tenant deployment: every sandbox without its own row
+   * would mount the same volume.
    */
   readonly volumeName?: string
   /**
@@ -322,12 +323,13 @@ export default class SandboxRegistry extends Service {
   private readonly store: BindingStore
   private readonly inflight = new Map<string, Promise<SandboxBinding>>()
   private readonly config: Required<
-    Omit<Config, 'store' | 'directory' | 'e2b' | 'mock' | 'storeKind' | 'platform'>
+    Omit<Config, 'store' | 'directory' | 'e2b' | 'mock' | 'docker' | 'storeKind' | 'platform'>
   > & {
     readonly directory?: SessionDirectory
     readonly store: BindingStore
     readonly e2b?: E2bConfig
     readonly mock?: MockConfig
+    readonly docker?: DockerConfig
   }
 
   constructor(ctx: Context, config: Config) {
@@ -355,7 +357,10 @@ export default class SandboxRegistry extends Service {
         'sandboxes: scope "user" has no workspace and cannot mount per-workspace volumes; use "workspace" or "session"',
       )
     }
-    const mountPath = config.volumeMountPath ?? '/desk/{workspaceId}'
+    const mountPath = config.volumeMountPath ?? '/desk'
+    if (!mountPath.startsWith('/') || mountPath === '/') {
+      throw new Error(`sandboxes: volumeMountPath must be an absolute path other than "/"; got "${mountPath}"`)
+    }
     const ossMounts = config.ossMounts ?? []
     for (const mount of ossMounts) {
       if (mount.bucketPath.trim() === '') {
@@ -380,6 +385,7 @@ export default class SandboxRegistry extends Service {
       adapter: config.adapter,
       ...(config.e2b === undefined ? {} : { e2b: config.e2b }),
       ...(config.mock === undefined ? {} : { mock: config.mock }),
+      ...(config.docker === undefined ? {} : { docker: config.docker }),
       ...(config.directory === undefined ? {} : { directory: config.directory }),
       store: this.store,
       sandboxTimeoutMs: config.sandboxTimeoutMs ?? 900_000,
@@ -591,7 +597,7 @@ export default class SandboxRegistry extends Service {
     owner: SessionOwner,
     generation: number,
   ): Promise<SandboxBinding> {
-    const workspaceRoot = this.workspaceRootFor(key, owner)
+    const workspaceRoot = this.workspaceRootFor(key)
     const mounts = this.resolveOssMounts(key, owner, workspaceRoot)
     const volumes: Record<string, string> = {}
     if (mounts.length === 0) {
@@ -662,13 +668,15 @@ export default class SandboxRegistry extends Service {
    * @returns the volume name.
    */
   private volumeName(key: SandboxKey, owner: SessionOwner): string {
-    if (this.config.volumeName !== '') return this.config.volumeName
     if (key.workspaceId === '') {
       throw new Error(
         'sandboxes: sandbox key has no workspace id; per-workspace volume isolation requires scope "workspace" or "session"',
       )
     }
+    // 平台记录的工作区卷优先：`volumeName` 是给还没有 volume_name 列的老部署的
+    // 兼容兜底，一旦它压过逐工作区的名字，所有租户就会挂到同一块卷上。
     if (owner.volumeName !== undefined && owner.volumeName !== '') return owner.volumeName
+    if (this.config.volumeName !== '') return this.config.volumeName
     return volumeNameFor(this.config.volumeNameTemplate, key.workspaceId)
   }
 
@@ -691,23 +699,13 @@ export default class SandboxRegistry extends Service {
   /**
    * The workspace root this sandbox mounts and reports to tools.
    *
-   * `workspaces.guest_root` from the platform wins: it is also the cwd the
-   * platform hands the session, so mounting anywhere else would leave that cwd
-   * pointing at an empty directory. Without it the configured template is
-   * rendered per sandbox.
+   * Each workspace owns its sandbox and volume, so the configured mount path is
+   * rendered per sandbox and is also the cwd the platform hands the session.
    * @param key - the sandbox key.
-   * @param owner - the session owner.
    * @returns an absolute path inside the sandbox.
    */
-  private workspaceRootFor(key: SandboxKey, owner: SessionOwner): string {
-    const fromOwner = owner.guestRoot?.trim() ?? ''
-    if (fromOwner === '') return this.render(this.config.volumeMountPath, key)
-    if (!fromOwner.startsWith('/') || fromOwner === '/') {
-      throw new Error(
-        `sandboxes: workspace guest_root must be an absolute path other than "/"; got "${fromOwner}"`,
-      )
-    }
-    return fromOwner.replace(/\/+$/u, '')
+  private workspaceRootFor(key: SandboxKey): string {
+    return this.render(this.config.volumeMountPath, key).replace(/\/+$/u, '')
   }
 
   /**
@@ -745,9 +743,12 @@ export default class SandboxRegistry extends Service {
       })
     }
     const rendered = base.map(mount => {
-      const bucketName = mount.bucketName.trim() || runtime?.ossBucket.trim() || ''
-      const endpoint = mount.endpoint.trim() || runtime?.ossEndpoint.trim() || ''
-      if ((bucketName === '' || endpoint === '') && this.config.adapter !== 'mock') {
+      const bucketName = mount.bucketName.trim() || runtime?.ossBucket?.trim() || ''
+      const endpoint = mount.endpoint.trim() || runtime?.ossEndpoint?.trim() || ''
+      // Local adapters map the same prefixes onto `storage.dir`; only a real
+      // cloud platform needs bucket and endpoint here.
+      const localAdapter = this.config.adapter === 'mock' || this.config.adapter === 'docker'
+      if ((bucketName === '' || endpoint === '') && !localAdapter) {
         throw new Error(
           'sandboxes: OSS mount needs bucketName and endpoint; configure them in the platform sandbox config',
         )
@@ -879,17 +880,22 @@ export default class SandboxRegistry extends Service {
     return service
   }
 
-  /** The initiating session, read from DSH's asynchronous context. */
+  /**
+   * The session this call belongs to: the initiating Agent during a turn, or
+   * the session pinned by {@link runWithSandboxSession} for browser-originated
+   * calls, which have no turn.
+   */
   private currentSessionId(): string | undefined {
     const agents = this.ctx.get('agents') as
       | { currentInitiator?: () => { session?: { id?: string } } | undefined }
       | undefined
     try {
-      return agents?.currentInitiator?.()?.session?.id
+      const initiator = agents?.currentInitiator?.()?.session?.id
+      if (initiator !== undefined) return initiator
     } catch {
       // A disposed agent registry throws; treat it as "not in a turn".
-      return undefined
     }
+    return sandboxSessionId()
   }
 }
 
@@ -915,6 +921,8 @@ function createPlatform(config: Config, ctx: Context): SandboxPlatform {
   switch (config.adapter) {
     case 'mock':
       return new MockPlatform(config.mock)
+    case 'docker':
+      return new DockerPlatform(config.docker)
     case 'e2b': {
       if (config.e2b === undefined) throw new Error('sandboxes: adapter "e2b" requires the e2b config block')
       const base = config.e2b

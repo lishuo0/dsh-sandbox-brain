@@ -26,6 +26,10 @@
     "./sandbox": {
       "types": "./lib/sandbox.d.ts",
       "default": "./lib/sandbox.js"
+    },
+    "./workspace-files": {
+      "types": "./lib/workspace-files.d.ts",
+      "default": "./lib/workspace-files.js"
     }
   },
   "dsh": {
@@ -46,9 +50,11 @@
   "peerDependencies": {
     "@brain/dsh-database": "*",
     "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-api-workspace-files": "*",
     "@deepseek-ai/dsh-fs": "*",
     "@deepseek-ai/dsh-fs-patch": "*",
     "@deepseek-ai/dsh-sandbox": "*",
+    "@deepseek-ai/dsh-sandbox-policy": "*",
     "@deepseek-ai/dsh-subprocess": "*"
   },
   "dependencies": {

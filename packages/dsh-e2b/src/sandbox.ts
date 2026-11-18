@@ -13,8 +13,16 @@ import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 
 /** Pass-through provider: isolation comes from the VM, not from argv wrapping. */
 export default class E2bSandboxProvider extends SandboxProvider {
-  override async confine(argv: readonly string[], _policy: SandboxPolicy): Promise<ConfinedArgv> {
+  override async confine(argv: readonly string[], policy: SandboxPolicy): Promise<ConfinedArgv> {
     // The VM is the boundary; no argv wrapping is added for any confined mode.
-    return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    // File tools are fenced separately by `E2bFileSystem`, but an arbitrary
+    // shell command can still write inside the VM (the workspace volume
+    // included), so `read-only` cannot be called fully enforced here.
+    return {
+      argv: [...argv],
+      enforcement: policy.mode === 'read-only' ? 'partial' : 'full',
+      denialSignatures: [],
+      runnerFailureRules: [],
+    }
   }
 }

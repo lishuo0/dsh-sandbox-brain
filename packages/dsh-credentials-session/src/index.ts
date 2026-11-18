@@ -14,6 +14,11 @@
  * error, so a misconfigured platform fails closed instead of borrowing another
  * tenant's key.
  *
+ * This is the deployment's only `credentials` service. Besides model keys it
+ * answers the record half from a process-local map: the DSH client connection
+ * keeps its browser-cookie signing secret there, and nothing else is meant to
+ * persist. Model keys themselves never enter that map.
+ *
  * @module @brain/dsh-credentials-session
  */
 
@@ -24,6 +29,7 @@ import {
 } from '@deepseek-ai/dsh-credentials'
 import type {
   CredentialInfo,
+  CredentialKey,
   CredentialRecord,
   CredentialRecordEntry,
   CredentialRecordInfo,
@@ -65,6 +71,8 @@ interface ResolvedConfig {
  */
 export default class SessionCredentialProvider extends CredentialProvider {
   private readonly config: ResolvedConfig
+  /** Process-local records: browser-cookie signing secrets, never model keys. */
+  private readonly records = new Map<CredentialKey, CredentialRecord>()
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx)
@@ -97,24 +105,37 @@ export default class SessionCredentialProvider extends CredentialProvider {
     throw new Error('credentials-session: model keys are supplied by the platform per session')
   }
 
-  override async readRecord(): Promise<CredentialRecord | undefined> {
-    return undefined
+  override async readRecord(key: CredentialKey): Promise<CredentialRecord | undefined> {
+    return this.records.get(key)
   }
 
-  override async describeRecord(): Promise<CredentialRecordInfo> {
-    return { configured: false, writable: false } as CredentialRecordInfo
+  override async describeRecord(key: CredentialKey): Promise<CredentialRecordInfo> {
+    const record = this.records.get(key)
+    return {
+      configured: record !== undefined,
+      ...(record === undefined ? {} : { kind: record.kind }),
+      writable: true,
+    } as CredentialRecordInfo
   }
 
   override async listRecords(): Promise<readonly CredentialRecordEntry[]> {
-    return []
+    return [...this.records].map(([key, record]) => ({ key, kind: record.kind }))
   }
 
-  override async modifyRecord(): Promise<CredentialRecord | undefined> {
-    throw new Error('credentials-session: records are not supported')
+  override async modifyRecord(
+    key: CredentialKey,
+    mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>,
+  ): Promise<CredentialRecord | undefined> {
+    const next = await mutate(this.records.get(key))
+    if (next !== undefined) {
+      this.records.set(key, next)
+      this.notifyRecordUpdated(key)
+    }
+    return this.records.get(key)
   }
 
-  override async deleteRecord(): Promise<void> {
-    throw new Error('credentials-session: records are not supported')
+  override async deleteRecord(key: CredentialKey): Promise<void> {
+    if (this.records.delete(key)) this.notifyRecordUpdated(key)
   }
 }
 

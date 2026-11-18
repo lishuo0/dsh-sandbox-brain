@@ -9,6 +9,17 @@
  *               trusted code, not a kernel boundary
  *   pty         no pseudo-terminal; interactive tools are unavailable
  *   pause       no suspend/resume
+ *   destroy     kills only the direct child processes, not their descendants
+ *
+ * Shared mode (an `objectDir` plus mounts) maps guest directories onto the same
+ * local object keys the platform writes. `readOnly` mounts are enforced for
+ * `files` mutations only — child processes run with plain OS permissions.
+ *
+ * Retained output is capped by `outputBufferBytes`; when the cap is exceeded the
+ * oldest bytes are dropped, so a re-attach (`process.connect(pid, from)`) is
+ * lossy and starts at the first byte still retained rather than at `from`.
+ * `capabilities.signal` stays `false`: there is no signalling channel beyond
+ * `process.kill`.
  *
  * So: use it for wiring and behaviour, never for security testing.
  *
@@ -18,7 +29,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join, posix, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type {
   DirEntry,
@@ -34,6 +45,16 @@ import type {
   SandboxSpec,
 } from './contract.ts'
 import { SandboxPlatformError } from './contract.ts'
+
+/**
+ * A guest path outside every mount. In the VM that directory simply does not
+ * exist, so `stat` answers "missing" while real I/O reports the policy failure.
+ */
+class NotMountedError extends SandboxPlatformError {
+  constructor(path: string) {
+    super({ kind: 'unauthorized' }, `path is not mounted: ${path}`)
+  }
+}
 
 /** Configuration for the mock adapter. */
 export interface MockConfig {
@@ -52,6 +73,7 @@ interface Layout {
   readonly objectDir?: string
   readonly mounts: readonly SandboxMount[]
   readonly guestRoot: string
+  readonly createdAt: number
 }
 
 /** One running process and its retained output. */
@@ -60,7 +82,14 @@ interface MockProcess {
   readonly argv: readonly string[]
   child: ChildProcess
   chunks: Buffer[]
+  /** Bytes currently retained in `chunks`. */
   buffered: number
+  /** Absolute offset of the first retained byte; advances when chunks are dropped. */
+  startOffset: number
+  /** Absolute number of bytes ever seen; `startOffset + buffered` outside races. */
+  total: number
+  /** Readers to wake when output or exit arrives. */
+  readonly readers: Set<() => void>
   exitCode?: number
   exited: boolean
 }
@@ -88,24 +117,46 @@ export class MockPlatform implements SandboxPlatform {
     const externalId = `mock-${randomUUID()}`
     const shared = this.objectDir !== undefined && (spec.mounts?.length ?? 0) > 0 && spec.workspaceRoot !== undefined
     const workspaceRoot = shared ? spec.workspaceRoot! : join(this.rootDir, externalId, 'workspace')
+    const createdAt = Date.now()
     if (shared) {
       for (const mount of spec.mounts ?? []) {
-        await mkdir(resolve(this.objectDir!, mount.bucketPath), { recursive: true })
+        await mkdir(this.mountHost(mount), { recursive: true })
       }
     } else {
       await mkdir(workspaceRoot, { recursive: true })
     }
     const handle: SandboxHandle = { externalId, endpoint: shared ? this.objectDir! : workspaceRoot, workspaceRoot }
     this.sandboxes.set(externalId, handle)
-    this.layouts.set(externalId, { objectDir: shared ? this.objectDir : undefined, mounts: spec.mounts ?? [], guestRoot: workspaceRoot })
+    this.layouts.set(externalId, { objectDir: shared ? this.objectDir : undefined, mounts: spec.mounts ?? [], guestRoot: workspaceRoot, createdAt })
     this.processes.set(externalId, new Map())
     return handle
+  }
+
+  /**
+   * Validate a mount and return the host directory behind it.
+   *
+   * A mount is a policy boundary: its guest directory must be absolute and
+   * non-root, and its bucket path must stay inside the object directory. Bad
+   * mounts are refused at create time so later path resolution can be simple.
+   */
+  private mountHost(mount: SandboxMount): string {
+    const guest = posix.normalize(mount.mountDir)
+    if (!mount.mountDir.startsWith('/') || guest === '/') {
+      throw new SandboxPlatformError({ kind: 'unauthorized' }, `invalid mountDir: ${mount.mountDir}`)
+    }
+    const base = resolve(this.objectDir!, mount.bucketPath)
+    const rel = relative(this.objectDir!, base)
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      throw new SandboxPlatformError({ kind: 'unauthorized' }, `bucketPath escapes object dir: ${mount.bucketPath}`)
+    }
+    return base
   }
 
   async get(externalId: string): Promise<SandboxInfo | undefined> {
     const handle = this.sandboxes.get(externalId)
     if (handle === undefined) return undefined
-    return { externalId, endpoint: handle.endpoint, state: 'running', createdAt: Date.now() }
+    const layout = this.layouts.get(externalId)
+    return { externalId, endpoint: handle.endpoint, state: 'running', createdAt: layout?.createdAt ?? Date.now() }
   }
 
   async list(): Promise<SandboxInfo[]> {
@@ -113,7 +164,7 @@ export class MockPlatform implements SandboxPlatform {
       externalId,
       endpoint: this.sandboxes.get(externalId)?.endpoint ?? '',
       state: 'running' as const,
-      createdAt: Date.now(),
+      createdAt: this.layouts.get(externalId)?.createdAt ?? Date.now(),
     }))
   }
 
@@ -161,18 +212,18 @@ class MockClient implements SandboxClient {
    * Escapes are refused rather than clamped: a caller that tries to leave the
    * sandbox has a bug, and silently rewriting the path would hide it.
    */
-  private jail(path: string): string {
+  private resolvePath(path: string): { host: string; readOnly: boolean } {
     if (this.layout.objectDir !== undefined) return this.shared(path)
     const absolute = resolve(this.handle.workspaceRoot, path)
     const rel = relative(this.handle.workspaceRoot, absolute)
     if (rel.startsWith('..') || (rel !== '' && resolve(absolute) !== absolute)) {
       throw new SandboxPlatformError({ kind: 'unauthorized' }, `path escapes sandbox: ${path}`)
     }
-    return absolute
+    return { host: absolute, readOnly: false }
   }
 
   /** Map a guest path onto the shared object directory. One mount never sees another. */
-  private shared(path: string): string {
+  private shared(path: string): { host: string; readOnly: boolean } {
     const guest = path.startsWith('/') ? posix.normalize(path) : posix.normalize(posix.join(this.layout.guestRoot, path))
     const mounts = [...this.layout.mounts].sort((left, right) => right.mountDir.length - left.mountDir.length)
     for (const mount of mounts) {
@@ -185,15 +236,21 @@ class MockClient implements SandboxClient {
       if (rel.startsWith('..')) {
         throw new SandboxPlatformError({ kind: 'unauthorized' }, `path escapes sandbox: ${path}`)
       }
-      return host
+      return { host, readOnly: mount.readOnly === true }
     }
-    throw new SandboxPlatformError({ kind: 'unauthorized' }, `path is not mounted: ${path}`)
+    throw new NotMountedError(path)
+  }
+
+  /** Refuse a mutation on a read-only mount. */
+  private writable(target: { host: string; readOnly: boolean }, path: string): string {
+    if (target.readOnly) throw new SandboxPlatformError({ kind: 'unauthorized' }, `path is read-only: ${path}`)
+    return target.host
   }
 
   readonly process = {
     start: async (spec: ProcessSpec, handlers?: ProcessHandlers): Promise<{ pid: number }> => {
       spec.signal?.throwIfAborted()
-      const cwd = this.jail(spec.cwd)
+      const cwd = this.resolvePath(spec.cwd).host
       const child = spawn(spec.argv[0] as string, spec.argv.slice(1), {
         cwd,
         env: { ...process.env, ...spec.env },
@@ -205,23 +262,35 @@ class MockClient implements SandboxClient {
         child,
         chunks: [],
         buffered: 0,
+        startOffset: 0,
+        total: 0,
+        readers: new Set(),
         exited: false,
+      }
+      const notify = (): void => {
+        for (const wake of entry.readers) wake()
       }
       const keep = (chunk: Buffer, channel: 'stdout' | 'stderr'): void => {
         entry.chunks.push(chunk)
         entry.buffered += chunk.byteLength
-        // Bound retained output; drop the oldest chunks first.
+        entry.total += chunk.byteLength
+        // Bound retained output; drop the oldest chunks first, advancing the
+        // absolute offset so re-attach readers know where retained bytes begin.
         while (entry.buffered > this.bufferLimit && entry.chunks.length > 1) {
           const dropped = entry.chunks.shift()
-          entry.buffered -= dropped?.byteLength ?? 0
+          const size = dropped?.byteLength ?? 0
+          entry.buffered -= size
+          entry.startOffset += size
         }
         handlers?.[channel]?.(chunk)
+        notify()
       }
       child.stdout?.on('data', (chunk: Buffer) => keep(chunk, 'stdout'))
       child.stderr?.on('data', (chunk: Buffer) => keep(chunk, 'stderr'))
       child.on('exit', code => {
         entry.exited = true
         entry.exitCode = code ?? undefined
+        notify()
       })
       if (entry.pid > 0) this.processes.set(entry.pid, entry)
       // The real platform cancels the start handshake; the local child has
@@ -291,44 +360,51 @@ class MockClient implements SandboxClient {
     const entry = this.processes.get(pid)
     if (entry === undefined) throw new SandboxPlatformError({ kind: 'not-found' }, `pid ${pid}`)
 
-    const replay = Buffer.concat(entry.chunks)
-    if (replay.byteLength > from) yield replay.subarray(from)
-
-    if (entry.exited) {
-      entry.child.removeAllListeners('exit')
-      return
+    // Absolute cursor into the byte stream. `from` below the retained window is
+    // clamped forward: bytes already dropped cannot be replayed.
+    let cursor = Math.max(from, entry.startOffset)
+    /** Emit retained bytes at or after `cursor`; stable across truncation. */
+    const drain = (): Buffer[] => {
+      if (cursor < entry.startOffset) cursor = entry.startOffset
+      const out: Buffer[] = []
+      let pos = entry.startOffset
+      for (const chunk of entry.chunks) {
+        const end = pos + chunk.byteLength
+        if (end > cursor) {
+          out.push(chunk.subarray(Math.max(0, cursor - pos)))
+          cursor = end
+        }
+        pos = end
+      }
+      return out
     }
-    const queue: Buffer[] = []
-    let wake: (() => void) | undefined
-    const push = (chunk: Buffer): void => {
-      queue.push(chunk)
-      wake?.()
-      wake = undefined
-    }
-    entry.child.stdout?.on('data', push)
-    entry.child.stderr?.on('data', push)
-    const done = new Promise<void>(resolveDone => {
-      entry.child.once('exit', () => resolveDone())
-    })
-    try {
-      for (;;) {
-        if (queue.length > 0) {
-          yield Buffer.concat(queue.splice(0))
+    for (;;) {
+      for (const chunk of drain()) yield chunk
+      if (entry.exited && entry.total <= cursor) return
+      // Register the reader before re-checking so output appended between the
+      // drain above and this await still wakes us (no lost-output window).
+      let wake: (() => void) | undefined
+      const notified = new Promise<void>(resolve => {
+        wake = resolve
+        entry.readers.add(resolve)
+      })
+      try {
+        const pending = drain()
+        if (pending.length > 0) {
+          for (const chunk of pending) yield chunk
           continue
         }
-        const finished = await Promise.race([done.then(() => true as const), new Promise<false>(r => { wake = () => r(false) })])
-        if (finished && queue.length === 0) return
+        await notified
+      } finally {
+        if (wake !== undefined) entry.readers.delete(wake)
       }
-    } finally {
-      entry.child.stdout?.off('data', push)
-      entry.child.stderr?.off('data', push)
     }
   }
 
   readonly files = {
     read: async (path: string): Promise<Uint8Array> => {
       try {
-        return await readFile(this.jail(path))
+        return await readFile(this.resolvePath(path).host)
       } catch (error) {
         throw mapFsError(error)
       }
@@ -336,8 +412,9 @@ class MockClient implements SandboxClient {
 
     write: async (path: string, data: Uint8Array): Promise<void> => {
       try {
-        await mkdir(dirname(this.jail(path)), { recursive: true })
-        await writeFile(this.jail(path), data)
+        const host = this.writable(this.resolvePath(path), path)
+        await mkdir(dirname(host), { recursive: true })
+        await writeFile(host, data)
       } catch (error) {
         throw mapFsError(error)
       }
@@ -345,7 +422,7 @@ class MockClient implements SandboxClient {
 
     list: async (path: string): Promise<DirEntry[]> => {
       try {
-        const entries = await readdir(this.jail(path), { withFileTypes: true })
+        const entries = await readdir(this.resolvePath(path).host, { withFileTypes: true })
         return entries.map(entry => ({
           name: entry.name,
           path: join(path, entry.name),
@@ -358,7 +435,7 @@ class MockClient implements SandboxClient {
 
     stat: async (path: string): Promise<FileStat | undefined> => {
       try {
-        const info = await stat(this.jail(path))
+        const info = await stat(this.resolvePath(path).host)
         return {
           path,
           type: info.isFile() ? 'file' : info.isDirectory() ? 'directory' : 'other',
@@ -366,22 +443,28 @@ class MockClient implements SandboxClient {
           mtimeMs: info.mtimeMs,
         }
       } catch (error) {
-        if (isMissing(error)) return undefined
+        // Probing an ancestor of the workspace (a project-root marker such as
+        // `/desk/.git`) is a legitimate "does this exist" question. Those
+        // directories are not mounted, so answer missing rather than failing
+        // the whole turn with an authorization error.
+        if (error instanceof NotMountedError || isMissing(error)) return undefined
         throw mapFsError(error)
       }
     },
 
     remove: async (path: string): Promise<void> => {
-      await rm(this.jail(path), { recursive: true, force: true })
+      await rm(this.writable(this.resolvePath(path), path), { recursive: true, force: true })
     },
 
     rename: async (from: string, to: string): Promise<void> => {
-      await mkdir(dirname(this.jail(to)), { recursive: true })
-      await rename(this.jail(from), this.jail(to))
+      const source = this.writable(this.resolvePath(from), from)
+      const target = this.writable(this.resolvePath(to), to)
+      await mkdir(dirname(target), { recursive: true })
+      await rename(source, target)
     },
 
     makeDir: async (path: string): Promise<void> => {
-      await mkdir(this.jail(path), { recursive: true })
+      await mkdir(this.writable(this.resolvePath(path), path), { recursive: true })
     },
   }
 }
