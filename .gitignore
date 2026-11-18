@@ -3,3 +3,4 @@ dist/
 .dsh/
 packages/*/lib/
 var/
+config.yaml

@@ -1,0 +1,49 @@
+# 脑唯一配置。数据库、阿里云沙箱、OSS 与平台写同一套环境，密钥各自保管。
+# 用法：复制为 config.yaml。appKey / credentialsKey 必须与平台生成的值完全一致
+# （平台先起一次，把它的 credentialsKey 和 brain.appKey 抄过来），否则脑拒绝平台请求。
+# sandbox.apiKey 留空时，不连阿里云。storage.dir 与平台的对象目录是同一份。
+#
+# 数据库：不写这一段就用本地 SQLite，默认与平台共用同一个文件
+# （../dsh-sandbox-platform/var/dsh.sqlite），不需要安装数据库。
+# 本地沙箱默认用 Docker（每个工作区一个容器），没有 Docker 时回退 mock。
+# 要接 PostgreSQL（部署、多副本、共享库）时写 url，和平台保持同一个库：
+# database:
+#   url: postgres://dsh:dsh@localhost:5432/dsh
+# 想换 SQLite 文件位置时写 file（相对本项目根）：
+# database:
+#   file: ../dsh-sandbox-platform/var/dsh.sqlite
+
+database: {}
+
+aliyun:
+  sandbox:
+    apiKey: ""
+    apiUrl: https://api.cn-beijing.sandbox.aliyuncs.com
+    domain: cn-beijing.sandbox.aliyuncs.com
+    template: ""
+    roleArn: ""
+  oss:
+    region: cn-beijing
+    endpoint: ""
+    bucket: ""
+    accessKeyId: ""
+    accessKeySecret: ""
+
+# 内核 webserver 拒绝通配地址，本地只绑回环（平台也用 127.0.0.1 访问）。
+http:
+  host: 127.0.0.1
+  port: 8080
+
+# 必须与平台 brain.appId / brain.appKey、credentialsKey 完全一致。
+platform:
+  appId: platform
+  appKey: ""
+
+credentialsKey: ""
+
+# 引入的内核版本。主客户端 UI 也锁这一版。
+dshVersion: 0.2.2-rc.3
+
+# 本地沙箱（Docker 或 mock 回退）读这个目录，与平台 storage.dir 指同一处。
+storage:
+  dir: ../dsh-sandbox-platform/var/objects
