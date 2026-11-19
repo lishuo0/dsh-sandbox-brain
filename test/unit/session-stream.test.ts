@@ -8,6 +8,7 @@ import {
   sessionStreamPath,
 } from '../../packages/dsh-platform-api/src/session-stream.ts'
 import { FakeWebServer } from '../helpers/brain.ts'
+import { SESSION_SOCKET_PATH } from '../../packages/dsh-platform-api/src/session-socket.ts'
 
 /** 实时面只剩 SSE：路径形状、上行答复校验、Upgrade 审计（必须为空）。 */
 
@@ -28,10 +29,15 @@ describe('Upgrade 审计', () => {
     expect(auditUpgradeRoutes(new FakeWebServer())).toEqual([])
   })
 
-  it('出现任何 Upgrade 路由都视为违规', () => {
-    const web = new FakeWebServer()
-    web.registerUpgrade({ path: '/brain/v1/sessions/stream', handler: () => undefined })
-    expect(() => auditUpgradeRoutes(web)).toThrow(/no Upgrade routes are allowed/)
+  it('只放行文档里那一条会话 socket，其它 Upgrade 一律违规', () => {
+    const allowed = new FakeWebServer()
+    allowed.registerUpgrade({ path: SESSION_SOCKET_PATH, handler: () => undefined })
+    expect(auditUpgradeRoutes(allowed, [SESSION_SOCKET_PATH])).toEqual([SESSION_SOCKET_PATH])
+
+    const other = new FakeWebServer()
+    other.registerUpgrade({ path: '/brain/v1/sessions/stream', handler: () => undefined })
+    expect(() => auditUpgradeRoutes(other, [SESSION_SOCKET_PATH])).toThrow(/undocumented Upgrade routes/)
+    expect(() => auditUpgradeRoutes(other, [SESSION_SOCKET_PATH])).toThrow(/\/brain\/v1\/sessions\/stream/)
   })
 })
 

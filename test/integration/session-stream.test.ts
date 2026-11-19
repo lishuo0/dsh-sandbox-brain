@@ -22,7 +22,7 @@ import {
  *
  * 覆盖：鉴权/归属先于任何响应字节、ready 首帧、事件/状态/流式帧、
  * 上行答复的 409、审批/提问 waterfall、答复回原 answerer、断线后重放待答
- * 请求、keepalive 注释、Upgrade 审计（必须为空）。
+ * 请求、keepalive 注释；Upgrade 审核只放行会话 socket（本装配不注册它）。
  */
 
 const appKey = 'k'.repeat(24)
@@ -71,7 +71,7 @@ async function connect(sessionId = 'sess-a', headers: Record<string, string> = a
 }
 
 describe('脑侧会话级 SSE', () => {
-  it('没有任何 Upgrade 路由', () => {
+  it('SSE 装配本身不注册 Upgrade（socket 是独立的那一条）', () => {
     expect(auditUpgradeRoutes(brain.web)).toEqual([])
     expect(brain.web.upgrades.size).toBe(0)
   })

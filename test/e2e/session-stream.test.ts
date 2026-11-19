@@ -3,9 +3,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import { apply } from '../../packages/dsh-platform-api/src/index.ts'
 import { PREFIX } from '../../packages/dsh-platform-api/src/routes.ts'
 import { auditUpgradeRoutes } from '../../packages/dsh-platform-api/src/session-stream.ts'
+import { SESSION_SOCKET_PATH } from '../../packages/dsh-platform-api/src/session-socket.ts'
 import {
   call,
   FakeWebServer,
+  openSessionSocket,
   openSessionStream,
   startBrainServer,
   testContext,
@@ -102,9 +104,9 @@ async function createSession(): Promise<string> {
 }
 
 describe('会话流的装配', () => {
-  it('apply() 之后没有任何 Upgrade 路由（实时面只有 SSE）', () => {
-    expect(auditUpgradeRoutes(brain.web)).toEqual([])
-    expect(brain.web.upgrades.size).toBe(0)
+  it('apply() 之后唯一一条 Upgrade 路由是会话 socket', () => {
+    expect(auditUpgradeRoutes(brain.web, [SESSION_SOCKET_PATH])).toEqual([SESSION_SOCKET_PATH])
+    expect([...brain.web.upgrades.keys()]).toEqual([SESSION_SOCKET_PATH])
   })
 
   it('创建会话后可以建立 SSE 流，并收到 ready 首帧', async () => {
@@ -155,5 +157,23 @@ describe('会话流的装配', () => {
     expect(stream).toMatchObject({ type: 'stream', frame: { delta: '你' } })
     client.close()
     await client.closed
+  })
+
+  it('创建会话后可以建立会话 socket，帧集与 SSE 相同', async () => {
+    const sessionId = await createSession()
+    const client = await openSessionSocket(brain.baseUrl, sessionId, { headers: auth })
+    const ready = await client.waitFor(frame => frame.type === 'ready')
+    const status = await client.waitFor(frame => frame.type === 'status')
+    expect(ready).toMatchObject({ type: 'ready', sessionId })
+    expect(status).toMatchObject({ type: 'status', running: false })
+    client.close()
+    await client.closed
+  })
+
+  it('socket 握手也按平台用户校验归属，别人的会话 404', async () => {
+    const sessionId = await createSession()
+    await expect(
+      openSessionSocket(brain.baseUrl, sessionId, { headers: { ...auth, 'x-dsh-user-id': 'u2' } }),
+    ).rejects.toThrow(/404/)
   })
 })

@@ -1,13 +1,19 @@
 /**
- * 会话级实时面：一条 SSE 下行 + 一个 REST 上行。
+ * 会话级实时面：一条下行 + 一个上行。
  *
- * 下行 `GET /brain/v1/sessions/{id}/stream` 只承载一个会话：事件、assistant
- * 流式帧、驱动状态，以及需要用户拍板的交互请求（审批、提问、计划评审）。
- * 上行 `POST /brain/v1/sessions/{id}/answers` 只做一件事：把一次答复交回
- * 正在等待的 answerer。没有全局实时连接——跨会话的数据属于平台，走 REST。
+ * 下行有两种等价载体，帧集完全相同：
  *
- * 每条 SSE 帧的事件名固定为 `frame`，`data` 就是帧 JSON，帧集与
- * `docs/脑接口边界改造.md` §3.2.1 一致。会话由路径指定，不做 query 复写。
+ * - `GET /brain/v1/sessions/{id}/stream`：SSE，保留为回退。
+ * - `GET /brain/v1/session/socket`（Upgrade）：会话级 WebSocket，会话由
+ *   `sessionid` 头指定。上行的答复直接走这条连接（`{type:'answer'}`），
+ *   因此答复和下行落在同一个脑进程上，不需要跨副本路由。
+ *
+ * 上行 `POST /brain/v1/sessions/{id}/answers` 同样保留：没有 socket 的调用方
+ * 仍可单独提交答复。三条路径共用同一个待答表，答复只结算一次。
+ *
+ * 每条 SSE 帧的事件名固定为 `frame`，`data` 就是帧 JSON；socket 每条消息就是
+ * 一个帧 JSON，帧集与 `docs/脑接口边界改造.md` §3.2.1 一致。会话由路径或
+ * `sessionid` 头指定，不做 query 复写。
  *
  * @module @brain/dsh-platform-api/session-stream
  */
@@ -83,11 +89,25 @@ export interface SessionStreamOptions {
   readonly heartbeatMs?: number
 }
 
-/** A live SSE response pinned to one session. */
+/**
+ * One live downlink pinned to one session.
+ *
+ * `send` writes one frame; `detach` releases the subscription and the carrier.
+ * The SSE path and the WebSocket path only differ in the carrier, so the
+ * buffering / replay / settle logic below is shared.
+ */
 interface Connection {
   readonly sessionId: string
-  readonly sse: SseWriter
   send(frame: SessionDownFrame): void
+  detach(): void
+}
+
+/** A transport that carries session frames for one connection. */
+export interface SocketSink {
+  /** Write one frame to the client. */
+  send(frame: SessionDownFrame): void
+  /** Drop the connection; safe to call twice. */
+  close(): void
 }
 
 /** One unanswered interactive request, kept in memory only. */
@@ -114,6 +134,19 @@ export interface SessionStream {
    * @param running - current driver state; announced as the first `status`.
    */
   attach(sessionId: string, req: IncomingMessage, res: ServerResponse, cursor: number, running?: boolean): void
+  /**
+   * Open one WebSocket downlink for a session.
+   *
+   * The socket is the same wire format as the SSE `data:` frames, one JSON
+   * object per message. Answers travel back on the same socket (see
+   * `session-socket.ts`), so the uplink cannot land on another replica.
+   * @param sessionId - already authorized and ownership-checked by the caller.
+   * @param sink - the socket carrier.
+   * @param cursor - durable log offset announced in the `ready` frame.
+   * @param running - current driver state; announced as the first `status`.
+   * @returns the detach function; calling it releases the subscription.
+   */
+  attachSocket(sessionId: string, sink: SocketSink, cursor: number, running?: boolean): () => void
   /**
    * Settle one pending interactive request.
    * @returns false when the request is unknown (already answered, cancelled,
@@ -297,27 +330,40 @@ export function createSessionStream(ctx: Context, options: SessionStreamOptions)
     }
   }
 
-  const attach = (sessionId: string, req: IncomingMessage, res: ServerResponse, cursor: number, running?: boolean): void => {
-    const sse = new SseWriter(res)
-    const connection: Connection = {
-      sessionId,
-      sse,
-      send: frame => sse.send('frame', frame),
+  /**
+   * Open one downlink over any carrier.
+   *
+   * Subscribe before announcing readiness; anything that lands in between is
+   * buffered, not lost. Durable history is backfilled by the client from
+   * `seq` over REST.
+   */
+  const openConnection = (
+    sessionId: string,
+    sink: SocketSink,
+    cursor: number,
+    running: boolean | undefined,
+  ): Connection => {
+    let finished = false
+    let unsubscribe: () => void = () => undefined
+    function finish(): void {
+      if (finished) return
+      finished = true
+      unsubscribe()
+      removeConnection(connection)
+      sink.close()
     }
-    addConnection(connection)
+    const connection: Connection = { sessionId, send: sink.send, detach: finish }
 
-    // Subscribe before announcing readiness; anything that lands in between is
-    // buffered, not lost. Durable history is backfilled by the client from
-    // `seq` over REST.
     let live = false
     const buffered: StreamFrame[] = []
-    const unsubscribe = options.gateway.subscribe(sessionId, frame => {
+    unsubscribe = options.gateway.subscribe(sessionId, frame => {
       if (!live) {
         buffered.push(frame)
         return
       }
       dispatch(connection, frame)
     })
+    addConnection(connection)
 
     connection.send({ type: 'ready', sessionId, seq: cursor })
     // Announce the initial driver state so a client (and the platform queue
@@ -338,21 +384,35 @@ export function createSessionStream(ctx: Context, options: SessionStreamOptions)
     live = true
     for (const frame of buffered) dispatch(connection, frame)
     buffered.length = 0
+    return connection
+  }
 
+  /**
+   * SSE downlink. Retained as the documented fallback: a deployment whose
+   * ingress cannot carry Upgrade (or a platform build that has not switched to
+   * the socket) still gets the exact same frame set here.
+   */
+  const attach = (sessionId: string, req: IncomingMessage, res: ServerResponse, cursor: number, running?: boolean): void => {
+    const sse = new SseWriter(res)
+    const connection = openConnection(
+      sessionId,
+      { send: frame => sse.send('frame', frame), close: () => sse.close() },
+      cursor,
+      running,
+    )
     const heartbeat = setInterval(() => sse.comment('keepalive'), heartbeatMs)
     heartbeat.unref?.()
-
-    let finished = false
-    const finish = (): void => {
-      if (finished) return
-      finished = true
+    const stop = (): void => {
       clearInterval(heartbeat)
-      unsubscribe()
-      removeConnection(connection)
-      sse.close()
+      connection.detach()
     }
-    req.on('close', finish)
-    res.on('close', finish)
+    req.on('close', stop)
+    res.on('close', stop)
+  }
+
+  /** WebSocket downlink; the carrier owns ping/pong, this owns the subscription. */
+  const attachSocket = (sessionId: string, sink: SocketSink, cursor: number, running?: boolean): (() => void) => {
+    return openConnection(sessionId, sink, cursor, running).detach
   }
 
   const answer = (sessionId: string, requestId: string, outcome: AnswerOutcome): boolean => {
@@ -364,12 +424,13 @@ export function createSessionStream(ctx: Context, options: SessionStreamOptions)
 
   return {
     attach,
+    attachSocket,
     answer,
     connectionCount: sessionId => connections.get(sessionId)?.size ?? 0,
     pendingCount: sessionId => pending.get(sessionId)?.size ?? 0,
     close() {
       for (const set of connections.values()) {
-        for (const connection of set) connection.sse.close()
+        for (const connection of set) connection.detach()
       }
       connections.clear()
       pending.clear()
@@ -393,21 +454,24 @@ export function normalizeOutcome(value: unknown): AnswerOutcome | undefined {
 }
 
 /**
- * Assert the deployment exposes no Upgrade routes.
+ * Assert the deployment exposes only the documented Upgrade routes.
  *
- * 实时面改成 SSE 之后，脑上不应再有任何 WebSocket；"只用文档里的接口"
- * 这条规则由启动/测试时的机器检查兜底。
+ * 实时面收敛为「会话级 SSE + 会话级 socket」之后，脑上只允许一条 WebSocket：
+ * `session-socket.ts` 注册的会话 socket。其它任何 Upgrade 路由都是绕过文档的
+ * 隐式接口，这条规则由启动/测试时的机器检查兜底。
  * @param webServer - the host webserver.
- * @returns the registered Upgrade paths, always empty.
- * @throws when any Upgrade route is registered.
+ * @param allowed - Upgrade paths this deployment documents.
+ * @returns the registered Upgrade paths.
+ * @throws when a path outside `allowed` is registered.
  */
-export function auditUpgradeRoutes(webServer: unknown): readonly string[] {
+export function auditUpgradeRoutes(webServer: unknown, allowed: readonly string[] = []): readonly string[] {
   const table = (webServer as { upgrades?: Map<string, { path?: string }> } | undefined)?.upgrades
   const paths = table === undefined ? [] : [...table.values()].map(route => route.path ?? '')
-  if (paths.length > 0) {
+  const unexpected = paths.filter(path => !allowed.includes(path))
+  if (unexpected.length > 0) {
     throw new Error(
-      'platform-api: no Upgrade routes are allowed; found '
-      + paths.map(path => `"${path}"`).join(', '),
+      'platform-api: undocumented Upgrade routes are not allowed; found '
+      + unexpected.map(path => `"${path}"`).join(', '),
     )
   }
   return paths

@@ -49,12 +49,12 @@ flowchart TB
 
 ## 对外 API
 
-全部能力都在 `/brain/v1` 一个 HTTP 面上：JSON 请求 + SSE 事件流。没有 WebSocket，也没有 Upgrade 路由；字段、请求体和错误码见 [接口文档](./docs/接口.md)，新增路由必须先写进文档再实现。
+全部能力都在 `/brain/v1` 一个 HTTP 面上：JSON 请求 + 事件流。会话实时面是一条**会话级 WebSocket**（`GET /brain/v1/session/socket`，会话由 `sessionid` 头指定，答复带内上行）；除了这条已文档化的 Upgrade，没有其他 Upgrade 路由（装配时由 `auditUpgradeRoutes` 校验）；字段、请求体和错误码见 [接口文档](./docs/接口.md)，新增路由必须先写进文档再实现。
 
 按用途分六类：
 
 - **会话生命周期**：新建或恢复会话、从日志分叉、中断当前轮次。
-- **消息与实时流**：提交消息（排队或插话），用 SSE 订阅会话事件、状态和流式输出，答复审批/提问/计划评审，按 `seq` 补历史。
+- **消息与实时流**：提交消息（排队或插话），用会话 WebSocket 订阅会话事件、状态和流式输出，答复审批/提问/计划评审也在同一条连接上带内上行；按 `seq` 补历史。
 - **会话内操作**：投影基线、切模型、斜杠命令、目标、预设、反馈。
 - **后台任务**：任务清单、增量输出、终止。
 - **工作区文件**：列目录、读写内容、文件元信息。
@@ -78,7 +78,8 @@ sequenceDiagram
   Note over P: 先建好工作区与会话，登记归属
   P->>B: POST /sessions
   B-->>P: 201
-  P->>B: GET /stream 订阅实时流
+  P->>B: Upgrade /session/socket（头 sessionid）
+  B-->>P: ready / status
   P->>B: POST /messages
   B-->>P: 202，status running
   B-->>P: stream 帧（模型输出）
@@ -86,13 +87,14 @@ sequenceDiagram
   S-->>B: 文件 / 命令输出
   B-->>P: event 帧（tool/call、tool/result）
   B-->>P: waterfall（审批请求）
-  P->>B: POST /answers（approved）
+  P->>B: {type:'answer'} 带内上行（approved）
+  B-->>P: ack
   B-->>P: event turn/end，status idle
   Note over P: 断线用 /events?after=N 补齐，重启后用同一 sessionId 恢复
 ```
 
 - `stream` 的 `event` 帧只实时、不回放；断线后用 `GET /events?after=N` 按 `seq` 补齐。
-- 审批、提问、计划评审共用一条通道：下行是 `waterfall` 帧，上行是 `POST /answers`。
+- 审批、提问、计划评审共用一条通道：下行是 `waterfall` 帧，上行是 socket 带内的 `answer`。
 - 沙箱懒创建：会话可以先纯对话，第一次需要文件或进程时才建沙箱。
 
 ## 部署启动

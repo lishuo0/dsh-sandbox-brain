@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
+import { WebSocket } from 'ws'
 import { Context } from '@deepseek-ai/cordis'
 import type { BrainGateway, StreamFrame } from '../../packages/dsh-platform-api/src/routes.ts'
+import { SESSION_SOCKET_PATH } from '../../packages/dsh-platform-api/src/session-socket.ts'
 
 /** 路由注册，形状与 @deepseek-ai/dsh-host-webserver 一致。 */
 export interface WebRoute {
@@ -366,6 +368,141 @@ export async function openSessionStream(
     close() {
       controller.abort()
       reader.cancel().catch(() => undefined)
+    },
+  }
+}
+
+/** A session-socket client: same downlink frames as SSE, answers in-band. */
+export interface SessionSocketClient {
+  readonly frames: StreamFrameMessage[]
+  waitFor(predicate: (frame: StreamFrameMessage) => boolean, timeoutMs?: number): Promise<StreamFrameMessage>
+  /** Send one in-band answer and resolve with the server's `ack`/`answer-error`. */
+  answer(requestId: string, outcome: unknown): Promise<StreamFrameMessage>
+  readonly closed: Promise<void>
+  close(): void
+}
+
+/**
+ * Open the real session socket: one WSS with app credentials and the
+ * `sessionid` header, exactly as the platform client does.
+ */
+export async function openSessionSocket(
+  baseUrl: string,
+  sessionId: string,
+  options: { headers?: Record<string, string>; timeoutMs?: number } = {},
+): Promise<SessionSocketClient> {
+  const url = new URL(SESSION_SOCKET_PATH, baseUrl)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  const ws = new WebSocket(url, {
+    headers: { sessionid: sessionId, ...(options.headers ?? {}) },
+  })
+
+  const frames: StreamFrameMessage[] = []
+  const waiters = new Set<{
+    predicate: (frame: StreamFrameMessage) => boolean
+    resolve: (frame: StreamFrameMessage) => void
+    reject: (error: Error) => void
+    timer: NodeJS.Timeout
+  }>()
+  let resolveClosed: () => void = () => undefined
+  const closed = new Promise<void>(done => { resolveClosed = done })
+  let finished = false
+
+  const finish = (): void => {
+    if (finished) return
+    finished = true
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(`socket closed; frames ${JSON.stringify(frames)}`))
+    }
+    waiters.clear()
+    resolveClosed()
+  }
+
+  const deliver = (frame: StreamFrameMessage): void => {
+    frames.push(frame)
+    for (const waiter of [...waiters]) {
+      if (!waiter.predicate(frame)) continue
+      waiters.delete(waiter)
+      clearTimeout(waiter.timer)
+      waiter.resolve(frame)
+    }
+  }
+
+  // Attach the frame listener before waiting for `open`: the server sends
+  // `ready`/`status` immediately after the handshake, so messages can be
+  // emitted in the same turn the client reports `open`.
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return
+    try {
+      const frame = JSON.parse(data.toString()) as StreamFrameMessage
+      if (frame !== null && typeof frame === 'object') deliver(frame)
+    } catch {
+      /* ignore malformed frames */
+    }
+  })
+  ws.on('close', finish)
+  ws.on('error', finish)
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('session socket timed out')), options.timeoutMs ?? 5_000)
+    timer.unref?.()
+    let settled = false
+    ws.once('open', () => {
+      settled = true
+      clearTimeout(timer)
+      resolve()
+    })
+    ws.once('unexpected-response', (_request, response) => {
+      settled = true
+      clearTimeout(timer)
+      const status = response.statusCode ?? 0
+      const chunks: Buffer[] = []
+      response.on('data', (chunk: Buffer) => chunks.push(chunk))
+      response.on('end', () => {
+        reject(new Error(`session socket rejected: ${status} ${Buffer.concat(chunks).toString('utf8')}`))
+      })
+      ws.terminate()
+    })
+    ws.once('error', (error: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+
+  return {
+    frames,
+    waitFor(predicate, timeoutMs = 5_000) {
+      const existing = frames.find(predicate)
+      if (existing !== undefined) return Promise.resolve(existing)
+      if (finished) return Promise.reject(new Error(`socket closed; frames ${JSON.stringify(frames)}`))
+      return new Promise<StreamFrameMessage>((done, fail) => {
+        const timer = setTimeout(() => {
+          waiters.delete(holder)
+          fail(new Error(`socket frame timed out; seen ${JSON.stringify(frames)}`))
+        }, timeoutMs)
+        timer.unref?.()
+        const holder = { predicate, resolve: done, reject: fail, timer }
+        waiters.add(holder)
+      })
+    },
+    async answer(requestId, outcome) {
+      ws.send(JSON.stringify({ type: 'answer', requestId, outcome }))
+      return this.waitFor(
+        frame => (frame.type === 'ack' || frame.type === 'answer-error') && frame.requestId === requestId,
+        5_000,
+      )
+    },
+    closed,
+    close() {
+      finish()
+      try {
+        ws.close()
+      } catch {
+        /* already closing */
+      }
     },
   }
 }

@@ -19,6 +19,9 @@
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf lib"
   },
+  "dependencies": {
+    "ws": "^8.23.0"
+  },
   "peerDependencies": {
     "@brain/dsh-credentials-session": "*",
     "@brain/dsh-session-pg": "*",
