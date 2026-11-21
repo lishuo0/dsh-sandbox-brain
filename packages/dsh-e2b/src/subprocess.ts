@@ -29,9 +29,13 @@ import type {
 } from '@deepseek-ai/dsh-subprocess'
 import { SandboxPlatformError, type ProcessInfo, type SandboxClient } from './contract.ts'
 import type { SandboxBinding } from './registry.ts'
+import { sandboxSessionId } from './session-scope.ts'
 
 /** How often an untracked remote process is polled for exit. */
 const POLL_MS = 250
+
+/** How deep a session's secret inheritance is followed, matching credentials-session. */
+const MAX_SECRET_DEPTH = 8
 
 /**
  * Upper bound on how long a terminated process may take to settle `done`.
@@ -141,13 +145,14 @@ export default class E2bSubprocess extends SubprocessRuntime {
         settle(abortedOutcome())
         return
       }
+      const env = this.spawnEnv(spec.env)
       let started: { pid: number }
       try {
         started = await client.process.start(
           {
             argv: spec.argv,
             cwd: spec.cwd,
-            ...(spec.env === undefined ? {} : { env: definedEnv(spec.env) }),
+            ...(env === undefined ? {} : { env }),
             stdin: spec.stdio.stdin === 'ignore' ? 'ignore' : 'pipe',
             ...(spec.signal === undefined ? {} : { signal: spec.signal }),
           },
@@ -273,6 +278,68 @@ export default class E2bSubprocess extends SubprocessRuntime {
       throw new Error('E2B adapter: process operations require an initiating session')
     }
     return binding
+  }
+
+  /**
+   * The environment a child process starts with.
+   *
+   * The platform's per-session secret is merged last: a command must not be able
+   * to shadow the token it was given, and a subagent session — born inside the
+   * brain — inherits its parent's secret the same way it inherits the sandbox.
+   * @param spec - the caller's environment, when it supplied one.
+   * @returns the merged environment, or undefined when there is nothing to pass.
+   */
+  private spawnEnv(spec: NodeJS.ProcessEnv | undefined): Record<string, string> | undefined {
+    const base = spec === undefined ? {} : definedEnv(spec)
+    const secret = this.sessionSecret()
+    if (secret === undefined) return Object.keys(base).length === 0 ? undefined : base
+    return { ...base, [secret.env]: secret.value }
+  }
+
+  /** The platform-supplied secret for the session this spawn belongs to. */
+  private sessionSecret(): { env: string; value: string } | undefined {
+    const store = this.ctx.get('sessionSecrets') as
+      | { get(sessionId: string): { env: string; value: string } | undefined }
+      | undefined
+    if (store === undefined) return undefined
+    const sessionId = this.currentSessionId()
+    if (sessionId === undefined) return undefined
+    const seen = new Set<string>()
+    let id: string | undefined = sessionId
+    for (let depth = 0; id !== undefined && depth < MAX_SECRET_DEPTH && !seen.has(id); depth += 1) {
+      seen.add(id)
+      const secret = store.get(id)
+      if (secret !== undefined) return secret
+      id = this.parentSessionOf(id)
+    }
+    return undefined
+  }
+
+  /** The session this call belongs to, with the same precedence as the registry. */
+  private currentSessionId(): string | undefined {
+    const agents = this.ctx.get('agents') as
+      | { currentInitiator?: () => { session?: { id?: string } } | undefined }
+      | undefined
+    try {
+      const initiator = agents?.currentInitiator?.()?.session?.id
+      if (initiator !== undefined) return initiator
+    } catch {
+      // A disposed agent registry throws; treat it as "not in a turn".
+    }
+    return sandboxSessionId()
+  }
+
+  /** The durable parent of one live child session. */
+  private parentSessionOf(sessionId: string): string | undefined {
+    const agents = this.ctx.get('agents') as
+      | { get(id: string): { session?: { header?: { parentSession?: unknown } } } | undefined }
+      | undefined
+    try {
+      const parent = agents?.get(sessionId)?.session?.header?.parentSession
+      return parent === undefined || parent === null || String(parent) === '' ? undefined : String(parent)
+    } catch {
+      return undefined
+    }
   }
 
   /**

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
-import SessionCredentialProvider from '../../packages/dsh-credentials-session/src/index.ts'
+import SessionCredentialProvider, { withRequestModelKey } from '../../packages/dsh-credentials-session/src/index.ts'
 import type { SessionModelKeys } from '../../packages/dsh-credentials-session/src/index.ts'
 import { testContext } from '../helpers/brain.ts'
 
@@ -115,6 +115,24 @@ describe('credentials-session：按会话解析模型密钥', () => {
     const { provider } = harness({ current: 's1', keys: { s1: 'sk-s1' } })
     await expect(provider.set(KEY, 'x')).rejects.toThrow(/supplied by the platform per session/)
     await expect(provider.unset(KEY)).rejects.toThrow(/supplied by the platform per session/)
+  })
+
+  it('10. 请求作用域里的钥匙优先于会话，作用域结束即失效', async () => {
+    const { provider } = harness({ current: 's1', keys: { s1: 'sk-s1' } })
+    await expect(withRequestModelKey('sk-request', () => provider.resolve(KEY))).resolves.toEqual({
+      value: 'sk-request',
+      source: 'request',
+    })
+    // 作用域退出后回到会话钥匙，不留下进程级的「最近一次」。
+    await expect(provider.resolve(KEY)).resolves.toEqual({ value: 'sk-s1', source: 'session' })
+  })
+
+  it('11. 无会话的一次性调用（评估）也能解析，只要请求钉了钥匙', async () => {
+    const { provider } = harness({ keys: { s1: 'sk-s1' } })
+    await expect(provider.resolve(KEY)).resolves.toBeUndefined()
+    await expect(withRequestModelKey('sk-request', () => provider.resolve(KEY))).resolves.toMatchObject({
+      value: 'sk-request',
+    })
   })
 })
 

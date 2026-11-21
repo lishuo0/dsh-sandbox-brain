@@ -22,6 +22,7 @@
  * @module @brain/dsh-credentials-session
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Context } from '@deepseek-ai/cordis'
 import {
   CredentialProvider,
@@ -49,6 +50,25 @@ declare module '@deepseek-ai/cordis' {
     /** Model keys supplied by the platform for active sessions. */
     sessionModelKeys?: SessionModelKeys
   }
+}
+
+/**
+ * 请求作用域的模型密钥。
+ *
+ * 无会话的模型调用（接单评估）没有发起方 Agent，会话查找必然为空；调用方
+ * 用 `withRequestModelKey` 把本次请求的密钥钉在异步作用域里。作用域结束即
+ * 失效，不会变成全局回落。
+ */
+const requestKey = new AsyncLocalStorage<string>()
+
+/**
+ * 在请求作用域里固定本次调用的模型密钥。
+ * @param key - 本次请求使用的密钥。
+ * @param run - 在该作用域内执行的调用。
+ * @returns 调用的返回值。
+ */
+export function withRequestModelKey<T>(key: string, run: () => T): T {
+  return requestKey.run(key, run)
 }
 
 /** Plugin configuration. */
@@ -81,6 +101,8 @@ export default class SessionCredentialProvider extends CredentialProvider {
 
   override async resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
     if (String(ref) !== String(this.config.ref)) return undefined
+    const scoped = requestKey.getStore()
+    if (scoped !== undefined) return { value: scoped, source: 'request' }
     const sessionId = currentSessionId(this.ctx)
     if (sessionId === undefined) return undefined
     const key = sessionKey(this.ctx, sessionId)

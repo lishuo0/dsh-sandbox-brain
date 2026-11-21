@@ -1052,7 +1052,7 @@ interface PluginEntry {
  * own model id, so a selection that is not listed yet is appended before the
  * call is resolved.
  */
-async function ensureProviderModel(ctx: Context, provider: string, model: string): Promise<void> {
+export async function ensureProviderModel(ctx: Context, provider: string, model: string): Promise<void> {
   const root = ctx.root as Context & {
     loader?: { entries(): Iterable<PluginEntry> }
   }

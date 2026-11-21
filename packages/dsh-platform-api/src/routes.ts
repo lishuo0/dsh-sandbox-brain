@@ -20,7 +20,15 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { AuthError, authenticate, type AppCredential, type AuthHeaders, type AuthenticatedCaller } from './auth.ts'
 import { HttpError, SseWriter, handle, query, readJson, segmentsAfter, sendError, sendJson } from './http.ts'
 import { normalizeOutcome, type SessionStream } from './session-stream.ts'
+import {
+  parseBootstrap,
+  parseSecret,
+  runBootstrap,
+  type SessionSecretStore,
+} from './session-setup.ts'
 import type { SessionModelKeys } from '@brain/dsh-credentials-session'
+import { evaluate, parseEvaluate } from './evaluate.ts'
+import { providerOfApi } from './model-protocol.ts'
 import { handleWorkspaceFiles } from './workspace-files.ts'
 
 /** Prefix every route lives under. */
@@ -28,6 +36,9 @@ export const PREFIX = '/brain/v1/sessions'
 
 /** 定时任务的 Remote 转发入口。 */
 const SCHEDULE_PREFIX = '/brain/v1/schedule'
+
+/** 无会话的一次性评估入口。 */
+const EVALUATE_PATH = '/brain/v1/superagent/evaluate'
 
 /** One frame on the live stream. */
 export type StreamFrame =
@@ -300,12 +311,16 @@ export interface RouteConfig {
   readonly modelBaseUrlHeader?: string
   /** Header carrying every model the user has configured. Defaults to `x-dsh-model-ids`. */
   readonly modelIdsHeader?: string
+  /** Header carrying the wire protocol the member configured. Defaults to `x-dsh-model-api`. */
+  readonly modelApiHeader?: string
   /** Sandbox runtime configuration store; absent when the platform does not manage E2B. */
   readonly sandboxConfig?: SandboxConfigStore
   /** Image generation configuration store; absent when image generation is not enabled. */
   readonly imageConfig?: ImageConfigStore
   /** 会话实时面；未装配时 `stream` / `answers` 回 501。 */
   readonly sessionStream?: SessionStream
+  /** 平台下发、只存在内存里的会话级子进程令牌；未装配时忽略 `secret`。 */
+  readonly sessionSecrets?: SessionSecretStore
 }
 
 /**
@@ -319,6 +334,7 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
   const modelKeyHeader = (config.modelKeyHeader ?? 'x-dsh-model-key').toLowerCase()
   const modelBaseUrlHeader = (config.modelBaseUrlHeader ?? 'x-dsh-model-base-url').toLowerCase()
   const modelIdsHeader = (config.modelIdsHeader ?? 'x-dsh-model-ids').toLowerCase()
+  const modelApiHeader = (config.modelApiHeader ?? 'x-dsh-model-api').toLowerCase()
 
   /** Authenticate one request, or answer 401 and return undefined. */
   const caller = (req: IncomingMessage, res: ServerResponse): AuthenticatedCaller | undefined => {
@@ -352,12 +368,16 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
    * it disappears when the brain restarts. Every platform call is an
    * opportunity to restore it; the operation is idempotent.
    */
-  const registerModelsFromHeaders = async (headers: IncomingHttpHeaders): Promise<void> => {
+  /** 本次请求的协议路由；不认识就直接 400，别等副作用发生后再抛。 */
+  const protocolOf = (headers: IncomingHttpHeaders): string =>
+    providerOfApi(headerValue(headers[modelApiHeader]))
+
+  const registerModelsFromHeaders = async (headers: IncomingHttpHeaders, provider: string): Promise<void> => {
     if (config.gateway.registerModels === undefined) return
     const raw = headers[modelIdsHeader]
     const value = Array.isArray(raw) ? raw[0] : raw
     const models = (value ?? '').split(',').map(id => id.trim()).filter(id => id !== '')
-    if (models.length > 0) await config.gateway.registerModels('user', models)
+    if (models.length > 0) await config.gateway.registerModels(provider, models)
   }
 
   // 平台改了 `dsh_workspaces` 之后，让脑重新投影工作区。租户由平台判定，这里只认应用凭据。
@@ -471,6 +491,10 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
       if (cwd === undefined || !cwd.startsWith('/')) {
         throw new HttpError(400, 'invalid-cwd', 'cwd must be an absolute path')
       }
+      // 校验放在建会话之前：参数错误不该留下一个半配置的会话。
+      const secret = parseSecret(input.secret)
+      const bootstrap = parseBootstrap(input.bootstrap)
+      const provider = protocolOf(req.headers)
       const created = await config.gateway.create({
         cwd,
         ...(optionalString(input.preset) === undefined ? {} : { preset: optionalString(input.preset) as string }),
@@ -480,12 +504,61 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
       if (modelBaseUrl !== undefined) config.modelBaseUrls?.set(created.sessionId, modelBaseUrl)
       if (sandbox !== undefined) config.sandboxConfig?.set(sandbox)
       if (image !== undefined) config.imageConfig?.set(image)
-      await registerModelsFromHeaders(req.headers)
+      // 省略即清除：会话不会继承上一次 create 留下的令牌。
+      config.sessionSecrets?.set(created.sessionId, secret)
+      await registerModelsFromHeaders(req.headers, provider)
       const modelId = headerValue(req.headers['x-dsh-model-id'])
       if (modelId !== undefined && config.gateway.selectModel !== undefined) {
-        await config.gateway.selectModel(created.sessionId, { provider: 'user', model: modelId })
+        await config.gateway.selectModel(created.sessionId, { provider, model: modelId })
+      }
+      if (bootstrap !== undefined) {
+        await runBootstrap(ctx, created.sessionId, bootstrap, cwd, secret)
       }
       sendJson(res, 201, { sessionId: created.sessionId, requestId: who.requestId })
+    }, diagnose),
+  })
+
+  // POST /brain/v1/superagent/evaluate
+  //
+  // 无会话的一次性模型调用：平台已经判定线程归哪个工作区，这里只回答
+  // 「要不要接活、范围是什么」。模型配置只认本次请求头，不回落到进程里
+  // 最近注册的值，否则一个成员会用到另一个成员的端点。
+  ctx.webServer.register({
+    kind: 'exact',
+    path: EVALUATE_PATH,
+    handler: (req, res) => void handle(req, res, async () => {
+      if (req.method !== 'POST') {
+        sendError(res, 405, 'method-not-allowed', 'use POST')
+        return
+      }
+      const who = caller(req, res)
+      if (who === undefined) return
+      const modelKey = headerValue(req.headers[modelKeyHeader])?.trim()
+      if (modelKey === undefined || modelKey === '') {
+        throw new HttpError(400, 'model-key-required', `missing ${modelKeyHeader} header`)
+      }
+      const modelBaseUrl = modelBaseUrlOf(headerValue(req.headers[modelBaseUrlHeader]))
+      if (modelBaseUrl === undefined) {
+        throw new HttpError(400, 'model-base-url-required', `missing or invalid ${modelBaseUrlHeader} header`)
+      }
+      const input = parseEvaluate(await readJson(req))
+      const provider = protocolOf(req.headers)
+      await registerModelsFromHeaders(req.headers, provider)
+      const modelId = headerValue(req.headers['x-dsh-model-id'])
+      // 客户端走了就没人要这个结论了，别再为空请求付模型钱。
+      const abort = new AbortController()
+      const onClose = (): void => abort.abort()
+      req.on('close', onClose)
+      try {
+        sendJson(res, 200, await evaluate(ctx, input, {
+          modelKey,
+          baseUrl: modelBaseUrl,
+          api: headerValue(req.headers[modelApiHeader]),
+          ...(modelId === undefined ? {} : { modelId }),
+        }, abort.signal))
+      } finally {
+        req.off('close', onClose)
+      }
     }, diagnose),
   })
 
@@ -588,7 +661,8 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
       // call may re-assert it. A command (compaction) or a model selection
       // resolves the model through the provider catalog without a platform
       // round-trip of its own, and the registration is lost on brain restart.
-      await registerModelsFromHeaders(req.headers)
+      const protocol = protocolOf(req.headers)
+      await registerModelsFromHeaders(req.headers, protocol)
       // Ownership first: every action below touches someone's session.
       if (config.ownership !== undefined && who.userId !== undefined) {
         await config.ownership.assert(sessionId, who.userId)
@@ -647,7 +721,8 @@ export function registerRoutes(ctx: Context, config: RouteConfig): void {
           }
           const body = asObject(await readJson(req))
           const model = optionalString(body.model) ?? optionalString(body.modelId)
-          const provider = optionalString(body.provider) ?? (model === undefined ? undefined : 'user')
+          const provider = optionalString(body.provider) ??
+            (model === undefined ? undefined : protocol)
           if (provider === undefined || model === undefined) {
             throw new HttpError(400, 'invalid-model', 'provider and model are required')
           }

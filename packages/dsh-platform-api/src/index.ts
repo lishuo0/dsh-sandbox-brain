@@ -25,12 +25,14 @@ import type { SessionModelKeys } from '@brain/dsh-credentials-session'
 import { DEFAULT_HEADERS, loadCredentials, type AppCredential, type AuthHeaders } from './auth.ts'
 import { createGateway } from './gateway.ts'
 import { createOwnershipGuard } from './ownership.ts'
+import { requestModelBaseUrl } from './request-context.ts'
 import {
   registerRoutes,
   type ImageConfigStore,
   type SandboxConfigStore,
   type SessionModelBaseUrls,
 } from './routes.ts'
+import { createSessionSecrets, type SessionSecretStore } from './session-setup.ts'
 import { auditUpgradeRoutes, createSessionStream } from './session-stream.ts'
 import { createSessionSocket, SESSION_SOCKET_PATH } from './session-socket.ts'
 
@@ -44,6 +46,13 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** Per-session model endpoints supplied by the platform. */
     sessionModelBaseUrls?: SessionModelBaseUrls
+    /**
+     * Per-session child-process secrets supplied by the platform.
+     *
+     * Read by the sandbox subprocess provider on every spawn; nothing else may
+     * use it.
+     */
+    sessionSecrets?: SessionSecretStore
   }
 }
 
@@ -120,6 +129,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
   ctx.provide('sessionModelKeys', store)
 
+  // Session secrets are the same shape of state: one token per live session,
+  // replaced by every create and dropped when the session goes away.
+  const sessionSecrets = createSessionSecrets()
+  ctx.provide('sessionSecrets', sessionSecrets)
+
   // Model endpoints are supplied by the platform with each create/resume.
   // Profile routes use the sentinel host; the request-time rewrite below picks
   // the endpoint registered for the session currently running.
@@ -165,6 +179,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on('session/disposed', session => {
     store.delete(String(session.id))
     modelBaseUrls.delete(String(session.id))
+    sessionSecrets.delete(String(session.id))
   })
 
   // Another replica took the write lease. Stop the live turn here instead of
@@ -212,6 +227,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     modelBaseUrls,
     sandboxConfig: sandboxStore,
     imageConfig: imageStore,
+    sessionSecrets,
     sessionStream,
     ...(config.modelKeyHeader === undefined ? {} : { modelKeyHeader: config.modelKeyHeader }),
     ...(config.modelBaseUrlHeader === undefined ? {} : { modelBaseUrlHeader: config.modelBaseUrlHeader }),
@@ -310,8 +326,11 @@ function installModelEndpointRewrite(ctx: Context, store: SessionModelBaseUrls):
       const requestUrl = input instanceof Request ? new URL(input.url) : new URL(String(input))
       if (requestUrl.hostname !== MODEL_ENDPOINT_SENTINEL) return original(input, init)
 
+      // 请求作用域优先：无会话的直连调用（评估）不能落到别人的端点上。
       const sessionId = currentSessionId(ctx)
-      const baseUrl = (sessionId === undefined ? undefined : store.get(sessionId)) ?? store.latest()
+      const baseUrl = requestModelBaseUrl()
+        ?? (sessionId === undefined ? undefined : store.get(sessionId))
+        ?? store.latest()
       if (baseUrl === undefined) {
         throw new Error('platform-api: no platform model endpoint registered for this session')
       }

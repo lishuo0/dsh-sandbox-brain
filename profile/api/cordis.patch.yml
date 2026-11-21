@@ -190,6 +190,9 @@
 - id: llm-deepseek
   disabled: true
 
+# pi-ai 的 `api` 是路由级配置，一条路由只能说一种线协议；成员在设置里选的
+# 协议经 `x-dsh-model-api` 下发，平台 API 按协议选下面这些路由。`user` 是
+# openai-completions 的历史名字，老平台不带请求头时行为不变。
 - id: llm-pi-ai
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
@@ -198,6 +201,45 @@
         displayName: User model
         apiKeyEnv: DSH_MODEL_KEY
         api: openai-completions
+        baseURL: http://dsh-model.invalid
+        headers: {}
+        models:
+          - id: unconfigured
+            name: Unconfigured
+            contextWindow: 128000
+            maxTokens: 8192
+            input:
+              - text
+      user-openai-responses:
+        displayName: User model (OpenAI Responses)
+        apiKeyEnv: DSH_MODEL_KEY
+        api: openai-responses
+        baseURL: http://dsh-model.invalid
+        headers: {}
+        models:
+          - id: unconfigured
+            name: Unconfigured
+            contextWindow: 128000
+            maxTokens: 8192
+            input:
+              - text
+      user-anthropic-messages:
+        displayName: User model (Anthropic Messages)
+        apiKeyEnv: DSH_MODEL_KEY
+        api: anthropic-messages
+        baseURL: http://dsh-model.invalid
+        headers: {}
+        models:
+          - id: unconfigured
+            name: Unconfigured
+            contextWindow: 128000
+            maxTokens: 8192
+            input:
+              - text
+      user-google-generative-ai:
+        displayName: User model (Gemini)
+        apiKeyEnv: DSH_MODEL_KEY
+        api: google-generative-ai
         baseURL: http://dsh-model.invalid
         headers: {}
         models:

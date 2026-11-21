@@ -101,6 +101,42 @@ describe('brain REST 路由', () => {
     })
   })
 
+  it('x-dsh-model-api 决定登记目录和选中模型用哪条协议路由', async () => {
+    const response = await call(brain.baseUrl, PREFIX, {
+      method: 'POST',
+      headers: {
+        ...auth,
+        'x-dsh-model-api': 'google-generative-ai',
+        'x-dsh-model-ids': 'gemini-2.5-pro',
+        'x-dsh-model-id': 'gemini-2.5-pro',
+      },
+      body: { cwd: '/desk' },
+    })
+    expect(response.status).toBe(201)
+    expect(gateway.registeredModels.at(-1)).toEqual({
+      provider: 'user-google-generative-ai',
+      models: ['gemini-2.5-pro'],
+    })
+    expect(gateway.modelSelections.at(-1)).toMatchObject({
+      provider: 'user-google-generative-ai',
+      model: 'gemini-2.5-pro',
+    })
+  })
+
+  it('不认识的协议回 400 model-protocol-invalid，且不建会话', async () => {
+    const before = gateway.sessions.size
+    const response = await call(brain.baseUrl, PREFIX, {
+      method: 'POST',
+      headers: { ...auth, 'x-dsh-model-api': 'openai', 'x-dsh-model-ids': 'gpt-4o' },
+      body: { cwd: '/desk' },
+    })
+    expect(response.status).toBe(400)
+    expect((response.json() as { error: { code: string } }).error.code).toBe('model-protocol-invalid')
+    // 协议校验发生在建会话和登记之前：不留半配置会话，也不按 user 静默登记。
+    expect(gateway.sessions.size).toBe(before)
+    expect(gateway.registeredModels.every(entry => !entry.models.includes('gpt-4o'))).toBe(true)
+  })
+
   it('带 x-dsh-model-id 认领会话时选中平台指定的模型', async () => {
     const response = await call(brain.baseUrl, PREFIX, {
       method: 'POST',
